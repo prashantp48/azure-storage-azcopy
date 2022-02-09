@@ -608,6 +608,10 @@ func (ja *jobsAdmin) BytesOverWire() int64 {
 	return ja.pacer.GetTotalTraffic()
 }
 
+func (ja *jobsAdmin) UpdateTargetBandwidth(newTarget int64) {
+	ja.pacer.UpdateTargetBytesPerSecond(newTarget)
+}
+
 func (ja *jobsAdmin) AddSuccessfulBytesInActiveFiles(n int64) {
 	atomic.AddInt64(&ja.atomicSuccessfulBytesInActiveFiles, n)
 }
