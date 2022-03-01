@@ -523,7 +523,7 @@ func (jpm *jobPartMgr) createPipelines(ctx context.Context) {
 		LogError: func(str string) { jpm.Log(pipeline.LogError, str) },
 		Panic:    jpm.Panic,
 		CallerID: fmt.Sprintf("JobID=%v, Part#=%d", jpm.Plan().JobID, jpm.Plan().PartNum),
-		Cancel:   jpm.jobMgr.Cancel,
+		Cancel:   nil,//jpm.jobMgr.Cancel,
 	}
 	// TODO: Consider to remove XferRetryPolicy and Options?
 	xferRetryOption := XferRetryOptions{

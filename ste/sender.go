@@ -22,6 +22,7 @@ package ste
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
@@ -154,7 +155,8 @@ func createSendToRemoteChunkFunc(jptm IJobPartTransferMgr, id common.ChunkID, bo
 // createChunkFunc adds a standard prefix, which all chunkFuncs require, to the given body
 func createChunkFunc(setDoneStatusOnExit bool, jptm IJobPartTransferMgr, id common.ChunkID, body func()) chunkFunc {
 	return func(workerId int) {
-		jptm.Log(pipeline.LogError, "Sender Chunk func")
+		jptm.Log(pipeline.LogError, fmt.Sprintf("Chunk func %s %d", id.Name, id.OffsetInFile()))
+		defer jptm.Log(pipeline.LogError, fmt.Sprintf("Chunk func %s %d done", id.Name, id.OffsetInFile()))
 
 		// BEGIN standard prefix that all chunk funcs need
 		defer jptm.ReportChunkDone(id) // whether successful or failed, it's always "done" and we must always tell the jptm

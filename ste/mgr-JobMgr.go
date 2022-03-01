@@ -102,6 +102,11 @@ type IJobMgr interface {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+func getPerfDisplayText(perfDiagnosticStrings []string, constraint common.PerfConstraint) (perfString string) {
+	perfString = ""
+	perfString = "[States: " + strings.Join(perfDiagnosticStrings, ", ") + "], "
+	return
+}
 
 func NewJobMgr(concurrency ConcurrencySettings, jobID common.JobID, appCtx context.Context, cpuMon common.CPUMonitor, level common.LogLevel,
 	       commandString string, logFileFolder string, tuner ConcurrencyTuner,
@@ -177,6 +182,13 @@ func NewJobMgr(concurrency ConcurrencySettings, jobID common.JobID, appCtx conte
 	// One routine constantly monitors the partsChannel.  It takes the JobPartManager from
 	// the Channel and schedules the transfers of that JobPart.
 	go jm.scheduleJobParts()
+	go func() {
+		for {
+			jm.Log(pipeline.LogError, getPerfDisplayText(jm.GetPerfInfo()))
+			time.Sleep(30 * time.Second)
+
+		}
+	}()
 	// In addition to the main pool (which is governed ja.poolSizer), we spin up a separate set of workers to process initiation of transfers
 	// (so that transfer initiation can't starve out progress on already-scheduled chunks.
 	// (Not sure whether that can really happen, but this protects against it anyway.)
