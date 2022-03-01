@@ -47,6 +47,7 @@ func newBlobDownloader() downloader {
 }
 
 func (bd *blobDownloader) Prologue(jptm IJobPartTransferMgr, srcPipeline pipeline.Pipeline) {
+	jptm.Log(pipeline.LogError, "blobDownloader Prologue")
 	if jptm.Info().SrcBlobType == azblob.BlobPageBlob {
 		// page blobs need a file-specific pacer
 		// See comments in uploader-pageBlob for the reasons, since the same reasons apply are are explained there
@@ -65,6 +66,7 @@ func (bd *blobDownloader) Epilogue() {
 // Returns a chunk-func for blob downloads
 func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, srcPipeline pipeline.Pipeline, destWriter common.ChunkedFileWriter, id common.ChunkID, length int64, pacer pacer) chunkFunc {
 	return createDownloadChunkFunc(jptm, id, func() {
+		jptm.Log(pipeline.LogError, "Blobdownloder Chunk Func")
 
 		// If the range does not contain any data, write out empty data to disk without performing download
 		if bd.pageRangeOptimizer != nil && !bd.pageRangeOptimizer.doesRangeContainData(

@@ -105,6 +105,7 @@ func getVerifiedChunkParams(transferInfo TransferInfo, memLimit int64) (chunkSiz
 }
 
 func newBlockBlobSenderBase(jptm IJobPartTransferMgr, destination string, p pipeline.Pipeline, pacer pacer, srcInfoProvider ISourceInfoProvider, inferredAccessTierType azblob.AccessTierType) (*blockBlobSenderBase, error) {
+	jptm.Log(pipeline.LogError, "newBlockBlobSenderBase")
 	// compute chunk count
 	chunkSize, numChunks, err := getVerifiedChunkParams(jptm.Info(), jptm.CacheLimiter().Limit())
 	if err != nil {
@@ -171,6 +172,7 @@ func (s *blockBlobSenderBase) RemoteFileExists() (bool, time.Time, error) {
 }
 
 func (s *blockBlobSenderBase) Prologue(ps common.PrologueState) (destinationModified bool) {
+	s.jptm.Log(pipeline.LogError, "newBlockBlobSenderBase Prologue")
 	if s.jptm.ShouldInferContentType() {
 		s.headersToApply.ContentType = ps.GetInferredContentType(s.jptm)
 	}
@@ -179,6 +181,7 @@ func (s *blockBlobSenderBase) Prologue(ps common.PrologueState) (destinationModi
 
 func (s *blockBlobSenderBase) Epilogue() {
 	jptm := s.jptm
+	jptm.Log(pipeline.LogError, "newBlockBlobSenderBase Epilogue")
 
 	s.muBlockIDs.Lock()
 	blockIDs := s.blockIDs

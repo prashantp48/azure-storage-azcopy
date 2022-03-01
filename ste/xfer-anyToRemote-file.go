@@ -182,6 +182,7 @@ func anyToRemote(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, sen
 
 // anyToRemote_file handles all kinds of sender operations for files - both uploads from local files, and S2S copies
 func anyToRemote_file(jptm IJobPartTransferMgr, info TransferInfo, p pipeline.Pipeline, pacer pacer, senderFactory senderFactory, sipf sourceInfoProviderFactory) {
+	jptm.Log(pipeline.LogError, "anyToRemote_file")
 
 	pseudoId := common.NewPseudoChunkIDForWholeFile(info.Source)
 	jptm.LogChunkStatus(pseudoId, common.EWaitReason.XferStart())
@@ -447,6 +448,7 @@ func scheduleSendChunks(jptm IJobPartTransferMgr, srcPath string, srcFile common
 		} else {
 			cf = s.(s2sCopier).GenerateCopyFunc(id, chunkIDCount, adjustedChunkSize, isWholeFile)
 		}
+		jptm.Log(pipeline.LogError, "scheduleSendChunks" )
 		jptm.ScheduleChunks(cf)
 
 		chunkIDCount++

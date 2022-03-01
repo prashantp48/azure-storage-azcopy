@@ -47,6 +47,7 @@ func remoteToLocal(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, d
 
 // general-purpose "any remote persistence location" to local, for files
 func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, df downloaderFactory) {
+	jptm.Log(pipeline.LogError, "remoteToLocal_file")
 
 	info := jptm.Info()
 
@@ -273,6 +274,7 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 		downloadFunc := dl.GenerateDownloadFunc(jptm, p, dstWriter, id, adjustedChunkSize, pacer)
 
 		// schedule the download chunk job
+		jptm.Log(pipeline.LogError, "Scheduling Chunks")
 		jptm.ScheduleChunks(downloadFunc)
 		chunkCount++
 
