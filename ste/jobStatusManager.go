@@ -68,6 +68,12 @@ func (jm *jobMgr) handleStatusUpdateMessage() {
 	js.CompleteJobOrdered = false
 	js.ErrorMsg = ""
 
+	/*
+	if jm.Context().Err() != nil {
+		return
+	}
+	*/
+
 	for {
 		select {
 		case msg := <-jstm.partCreated:

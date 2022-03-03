@@ -587,6 +587,11 @@ func (jm *jobMgr) reportJobPartDoneHandler() {
 	shouldLog := jm.ShouldLog(pipeline.LogInfo)
 
 	for {
+		/*
+		if jm.Context().Err() != nil {
+			return
+		}
+		*/
 		partProgressInfo := <-jm.jobPartProgress
 		jobPart0Mgr, ok := jm.jobPartMgrs.Get(0)
 		if !ok {
@@ -798,6 +803,17 @@ func (jm *jobMgr) poolSizer() {
 			jm.poolSizingChannels.scalebackRequestCh <- struct{}{}
 		}
 
+		/*
+		if jm.Context().Err() != nil {
+			if actualConcurrency == 0 {
+				return
+			}
+			//scale down all goroutines
+			for i := 0; i < targetConcurrency; i++ {
+				jm.poolSizingChannels.scalebackRequestCh <- struct{}{}
+			}
+		}*/
+
 		// wait for something to happen (maybe ack from the worker of the change, else a timer interval)
 		select {
 		case <-jm.poolSizingChannels.entryNotificationCh:
@@ -852,6 +868,11 @@ func (jm *jobMgr) RequestTuneSlowly() {
 func (jm *jobMgr) scheduleJobParts() {
 	startedPoolSizer := false
 	for {
+		/*
+		if jm.Context().Err() != nil {
+			return
+		}
+		*/
 		jobPart := <-jm.xferChannels.partsChannel
 
 		if !startedPoolSizer {
@@ -915,6 +936,11 @@ func (jm *jobMgr) transferProcessor(workerID int) {
 	}
 
 	for {
+		/*
+		if jm.Context().Err() != nil {
+			return
+		}
+		*/
 		// No scaleback check here, because this routine runs only in a small number of goroutines, so no need to kill them off
 		select {
 		case jptm := <-jm.xferChannels.normalTransferCh:

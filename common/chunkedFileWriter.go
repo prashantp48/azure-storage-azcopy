@@ -24,12 +24,15 @@ import (
 	"context"
 	"crypto/md5"
 	"errors"
+	"fmt"
 	"hash"
 	"io"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Azure/azure-pipeline-go/pipeline"
 )
 
 // Used to write all the chunks to a disk file
@@ -97,6 +100,16 @@ type chunkedFileWriter struct {
 	md5ValidationOption HashValidationOption
 
 	sourceMd5Exists bool
+
+	logger      chunkLogger
+
+	memStats    int64
+
+	dst         string
+}
+
+type chunkLogger interface {
+	Log(level pipeline.LogLevel, msg string)
 }
 
 type fileChunk struct {
@@ -111,7 +124,7 @@ type WriteSyncCloser interface {
 
 var flushPrintOnce sync.Once
 
-func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheLimiter CacheLimiter, chunkLogger ChunkStatusLogger, file WriteSyncCloser, numChunks uint32, maxBodyRetries int, md5ValidationOption HashValidationOption, sourceMd5Exists bool, flushInterval int) ChunkedFileWriter {
+func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheLimiter CacheLimiter, chunkLogger ChunkStatusLogger, file WriteSyncCloser, numChunks uint32, maxBodyRetries int, md5ValidationOption HashValidationOption, sourceMd5Exists bool, flushInterval int, logger chunkLogger) ChunkedFileWriter {
 	// Set max size for buffered channel. The upper limit here is believed to be generous, given worker routine drains it constantly.
 	// Use num chunks in file if lower than the upper limit, to prevent allocating RAM for lots of large channel buffers when dealing with
 	// very large numbers of very small files.
@@ -129,6 +142,9 @@ func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheL
 		md5ValidationOption:     md5ValidationOption,
 		sourceMd5Exists:         sourceMd5Exists,
 		flushInterval:           int64(flushInterval),
+		logger:                  logger,
+		memStats:                0,
+		dst:                     "",
 	}
 	go w.workerRoutine(ctx)
 	return w
@@ -146,6 +162,8 @@ const maxDesirableActiveChunks = 20 // TODO: can we find a sensible way to remov
 // Is here, as method of this struct, for symmetry with the point where we remove it's count
 // from the cache limiter, which is also in this struct.
 func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID, chunkSize int64) error {
+	atomic.AddInt64(&w.memStats, chunkSize)
+	w.logger.Log(pipeline.LogError, fmt.Sprintf("Narasimha: Adding %d to %s", chunkSize, id.Name))
 	w.chunkLogger.LogChunkStatus(id, EWaitReason.RAMToSchedule())
 	err := w.cacheLimiter.WaitUntilAdd(ctx, chunkSize, w.shouldUseRelaxedRamThreshold)
 	if err == nil {
@@ -156,7 +174,6 @@ func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID,
 
 // Threadsafe method to enqueue a new chunk for processing
 func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkSize int64, chunkContents io.Reader, retryable bool) error {
-
 	readDone := make(chan struct{})
 	if retryable {
 		// if retryable == true, that tells us that closing the reader
@@ -181,15 +198,26 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 	atomic.AddInt32(&w.totalReceivedChunkCount, 1)
 	atomic.AddInt64(&w.totalChunkReceiveMilliseconds, time.Since(readStart).Nanoseconds()/(1000*1000))
 
+	cleanup := func() {
+		atomic.AddInt64(&w.memStats, -chunkSize)
+		w.logger.Log(pipeline.LogError, fmt.Sprintf("Narasimha: Remove (EnqueueChunk) %d from %s", chunkSize, id.Name))
+		w.cacheLimiter.Remove(chunkSize) // remove this from the tally of scheduled-but-unsaved bytes
+		atomic.AddInt32(&w.activeChunkCount, -1)
+		w.slicePool.ReturnSlice(buffer)
+		w.chunkLogger.LogChunkStatus(id, EWaitReason.ChunkDone()) // this chunk is all finished
+	}
+
 	// enqueue it
 	w.chunkLogger.LogChunkStatus(id, EWaitReason.Sorting())
 	select {
 	case err = <-w.failureError:
 		if err != nil {
+			cleanup()
 			return err
 		}
 		return ChunkWriterAlreadyFailed // channel returned nil because it was closed and empty
 	case <-ctx.Done():
+		cleanup()
 		return ctx.Err()
 	case w.newUnorderedChunks <- fileChunk{id: id, data: buffer}:
 		return nil
@@ -233,6 +261,24 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 		md5Hasher = &nullHasher{}
 	}
 
+	defer func() {
+		w.logger.Log(pipeline.LogError,
+			fmt.Sprintf("Narasimha: Total allocation for %s: %d", w.dst, atomic.LoadInt64(&w.memStats)))
+	}()
+
+	cleanup := func() {
+		for _,chunk := range unsavedChunksByFileOffset {
+			atomic.AddInt64(&w.memStats, -int64(len(chunk.data)))
+			w.logger.Log(pipeline.LogError,
+				fmt.Sprintf("Narasimha: Remove (workerRoutine cleanup) %d from %s", int64(len(chunk.data)), chunk.id.Name))
+			w.cacheLimiter.Remove(int64(len(chunk.data))) // remove this from the tally of scheduled-but-unsaved bytes
+			atomic.AddInt32(&w.activeChunkCount, -1)
+			w.slicePool.ReturnSlice(chunk.data)
+			w.chunkLogger.LogChunkStatus(chunk.id, EWaitReason.ChunkDone()) // this chunk is all finished
+		}
+	}
+	defer cleanup()
+
 	for {
 		var newChunk fileChunk
 		var channelIsOpen bool
@@ -254,6 +300,9 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 
 		// index the new chunk
 		unsavedChunksByFileOffset[newChunk.id.OffsetInFile()] = newChunk
+		if w.dst == "" {
+			w.dst = newChunk.id.Name
+		}
 		w.chunkLogger.LogChunkStatus(newChunk.id, EWaitReason.PriorChunk()) // may have to wait on prior chunks to arrive
 
 		// Process all chunks that we can
@@ -329,6 +378,9 @@ func (w *chunkedFileWriter) setStatusForContiguousAvailableChunks(unsavedChunksB
 // Saves one chunk to its destination
 func (w *chunkedFileWriter) saveOneChunk(chunk fileChunk, md5Hasher hash.Hash) error {
 	defer func() {
+		atomic.AddInt64(&w.memStats, -int64(len(chunk.data)))
+		w.logger.Log(pipeline.LogError, 
+			fmt.Sprintf("Narasimha: Remove (saveOneChunk) %d from %s", int64(len(chunk.data)), chunk.id.Name))
 		w.cacheLimiter.Remove(int64(len(chunk.data))) // remove this from the tally of scheduled-but-unsaved bytes
 		atomic.AddInt32(&w.activeChunkCount, -1)
 		w.slicePool.ReturnSlice(chunk.data)
