@@ -27,7 +27,6 @@ import (
 	"hash"
 	"io"
 	"math"
-	"sync"
 	"sync/atomic"
 	"time"
 )
