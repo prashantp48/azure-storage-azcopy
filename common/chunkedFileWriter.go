@@ -93,6 +93,8 @@ type chunkedFileWriter struct {
 	md5ValidationOption HashValidationOption
 
 	sourceMd5Exists bool
+
+	currentAllocatedMem int64
 }
 
 type fileChunk struct {
@@ -117,6 +119,7 @@ func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheL
 		maxRetryPerDownloadBody: maxBodyRetries,
 		md5ValidationOption:     md5ValidationOption,
 		sourceMd5Exists:         sourceMd5Exists,
+		currentAllocatedMem:     0,
 	}
 	go w.workerRoutine(ctx)
 	return w
@@ -137,14 +140,15 @@ func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID,
 	w.chunkLogger.LogChunkStatus(id, EWaitReason.RAMToSchedule())
 	err := w.cacheLimiter.WaitUntilAdd(ctx, chunkSize, w.shouldUseRelaxedRamThreshold)
 	if err == nil {
+		atomic.AddInt64(&w.currentAllocatedMem, chunkSize)
 		atomic.AddInt32(&w.activeChunkCount, 1)
 	}
 	return err
+	//At this point, the book-keeping of this memory is chunkedFileWriter's responsibility
 }
 
 // Threadsafe method to enqueue a new chunk for processing
-func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkSize int64, chunkContents io.Reader, retryable bool) error {
-
+func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkSize int64, chunkContents io.Reader, retryable bool) (err error) {
 	readDone := make(chan struct{})
 	if retryable {
 		// if retryable == true, that tells us that closing the reader
@@ -158,8 +162,21 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 
 	// read into a buffer
 	buffer := w.slicePool.RentSlice(chunkSize)
+	
+	defer func() {
+		//cleanup stuff if we abruptly quit
+		if err == nil {
+			return //We've successfully queued, the worker will now takeover
+		}
+		w.cacheLimiter.Remove(chunkSize) // remove this from the tally of scheduled-but-unsaved bytes
+		w.slicePool.ReturnSlice(buffer)
+		atomic.AddInt32(&w.activeChunkCount, -1)
+		atomic.AddInt64(&w.currentAllocatedMem, -chunkSize)
+		w.chunkLogger.LogChunkStatus(id, EWaitReason.ChunkDone()) // this chunk is all finished
+	}()
+	
 	readStart := time.Now()
-	_, err := io.ReadFull(chunkContents, buffer)
+	_, err = io.ReadFull(chunkContents, buffer)
 	close(readDone)
 	if err != nil {
 		return err
@@ -178,8 +195,10 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 		}
 		return ChunkWriterAlreadyFailed // channel returned nil because it was closed and empty
 	case <-ctx.Done():
-		return ctx.Err()
+		err = ctx.Err()
+		return err
 	case w.newUnorderedChunks <- fileChunk{id: id, data: buffer}:
+		err = nil
 		return nil
 	}
 }
@@ -188,6 +207,11 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	// let worker know that no more will be coming
 	close(w.newUnorderedChunks)
+	
+	/* When flush finds active chunks, it is only those which have not rented a slice.
+	 * We clear accounted but unused memory here.
+	 */
+	w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentAllocatedMem))
 
 	// wait until all written to disk
 	select {
@@ -220,6 +244,17 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 		// save CPU time by not even computing a hash, if we don't want to check it, or have nothing to check it against
 		md5Hasher = &nullHasher{}
 	}
+
+	defer func() {
+		//cleanup stuff if we abruptly quit
+		for _, chunk := range unsavedChunksByFileOffset {
+			w.cacheLimiter.Remove(int64(chunk.id.length)) // remove this from the tally of scheduled-but-unsaved bytes
+			w.slicePool.ReturnSlice(chunk.data)
+			atomic.AddInt32(&w.activeChunkCount, -1)
+			atomic.AddInt64(&w.currentAllocatedMem, -chunk.id.length)
+			w.chunkLogger.LogChunkStatus(chunk.id, EWaitReason.ChunkDone()) // this chunk is all finished
+		}
+	}()
 
 	for {
 		var newChunk fileChunk
@@ -305,8 +340,9 @@ func (w *chunkedFileWriter) setStatusForContiguousAvailableChunks(unsavedChunksB
 func (w *chunkedFileWriter) saveOneChunk(chunk fileChunk, md5Hasher hash.Hash) error {
 	defer func() {
 		w.cacheLimiter.Remove(int64(len(chunk.data))) // remove this from the tally of scheduled-but-unsaved bytes
-		atomic.AddInt32(&w.activeChunkCount, -1)
 		w.slicePool.ReturnSlice(chunk.data)
+		atomic.AddInt32(&w.activeChunkCount, -1)
+		atomic.AddInt64(&w.currentAllocatedMem, -chunk.id.length)
 		w.chunkLogger.LogChunkStatus(chunk.id, EWaitReason.ChunkDone()) // this chunk is all finished
 	}()
 
