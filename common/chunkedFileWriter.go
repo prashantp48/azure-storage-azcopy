@@ -237,11 +237,13 @@ func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	close(w.newUnorderedChunks)
 	count:= atomic.AddInt64(&w.flushCount, 1)
 	
-	/* When flush finds active chunks, it is only those which have not rented a slice.
-	 * We clear accounted but unused memory here.
-	 */
-	w.logger.Log(pipeline.LogError, fmt.Sprintf("Flushing %s %d times. Cap: %d", w.dst, count, atomic.LoadInt64(&w.currentCapacity)))
-	//w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentCapacity))
+	defer func() {
+		/* When flush finds active chunks, it is only those which have not rented a slice.
+		 * We clear accounted but unused memory here.
+		 */
+		w.logger.Log(pipeline.LogError, fmt.Sprintf("Flushing %s %d times. Cap: %d", w.dst, count, atomic.LoadInt64(&w.currentCapacity)))
+		w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentCapacity))
+	}()
 
 	// wait until all written to disk
 	select {
