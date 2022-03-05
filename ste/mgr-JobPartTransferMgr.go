@@ -550,10 +550,11 @@ func (jptm *jobPartTransferMgr) ReportChunkDone(id common.ChunkID) (lastChunk bo
 // But that led to unwanted duplication of epilogue code, in the various types of chunkfunc. This routine
 // makes it easier to create DRY epilogue code.)
 func (jptm *jobPartTransferMgr) runActionAfterLastChunk() {
-	jptm.actionAfterLastChunkLock.Do(jptm.actionAfterLastChunk)
-	//if jptm.actionAfterLastChunk != nil {
-	//	jptm.actionAfterLastChunk()     // Call the final action first,
-	//	jptm.actionAfterLastChunk = nil // make sure it can't be run again, since epilogue methods are not expected to be idempotent,
+	//jptm.actionAfterLastChunkLock.Do(jptm.actionAfterLastChunk)
+	if jptm.actionAfterLastChunk != nil {
+		jptm.actionAfterLastChunk()     // Call the final action first,
+		jptm.actionAfterLastChunk = nil // make sure it can't be run again, since epilogue methods are not expected to be idempotent,
+	}
 }
 
 

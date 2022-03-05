@@ -233,7 +233,9 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 		MaxRetryPerDownloadBody,
 		jptm.MD5ValidationOption(),
 		sourceMd5Exists, 
-		getFlushInterval(downloadChunkSize))
+		getFlushInterval(downloadChunkSize),
+	        info.Destination,
+	        jptm)
 
 	// step 5c: run prologue in downloader (here it can, for example, create things that will require cleanup in the epilogue)
 	//common.GetLifecycleMgr().E2EAwaitAllowOpenFiles()

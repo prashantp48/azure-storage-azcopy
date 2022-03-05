@@ -29,6 +29,9 @@ import (
 	"math"
 	"sync/atomic"
 	"time"
+	"fmt"
+
+	"github.com/Azure/azure-pipeline-go/pipeline"
 )
 
 // Used to write all the chunks to a disk file
@@ -98,6 +101,16 @@ type chunkedFileWriter struct {
 	sourceMd5Exists bool
 
 	currentAllocatedMem int64
+
+	dst string
+
+	logger logger
+
+	flushCount int64
+}
+
+type logger interface {
+	Log(pipeline.LogLevel, string)
 }
 
 type fileChunk struct {
@@ -111,7 +124,9 @@ type WriteSyncCloser interface {
 }
 
 
-func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheLimiter CacheLimiter, chunkLogger ChunkStatusLogger, file WriteSyncCloser, numChunks uint32, maxBodyRetries int, md5ValidationOption HashValidationOption, sourceMd5Exists bool, flushInterval int) ChunkedFileWriter {
+func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheLimiter CacheLimiter, chunkLogger ChunkStatusLogger, 
+	file WriteSyncCloser, numChunks uint32, maxBodyRetries int, md5ValidationOption HashValidationOption, sourceMd5Exists bool, flushInterval int, dst string,
+	logger logger) ChunkedFileWriter {
 	// Set max size for buffered channel. The upper limit here is believed to be generous, given worker routine drains it constantly.
 	// Use num chunks in file if lower than the upper limit, to prevent allocating RAM for lots of large channel buffers when dealing with
 	// very large numbers of very small files.
@@ -130,6 +145,9 @@ func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheL
 		sourceMd5Exists:         sourceMd5Exists,
 		flushInterval:           int64(flushInterval),
 		currentAllocatedMem:     0,
+		flushCount: 0,
+		dst: dst,
+		logger: logger,
 	}
 	go w.workerRoutine(ctx)
 	return w
@@ -217,10 +235,12 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	// let worker know that no more will be coming
 	close(w.newUnorderedChunks)
+	count:= atomic.AddInt64(&w.flushCount, 1)
 	
 	/* When flush finds active chunks, it is only those which have not rented a slice.
 	 * We clear accounted but unused memory here.
 	 */
+	w.logger.Log(pipeline.LogError, fmt.Sprintf("Flushing %s %d times. Cap: %d", w.dst, count, atomic.LoadInt64(&w.currentAllocatedMem)))
 	w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentAllocatedMem))
 
 	// wait until all written to disk
