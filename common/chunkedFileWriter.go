@@ -100,7 +100,7 @@ type chunkedFileWriter struct {
 
 	sourceMd5Exists bool
 
-	currentAllocatedMem int64
+	currentCapacity int64
 
 	dst string
 
@@ -144,7 +144,7 @@ func NewChunkedFileWriter(ctx context.Context, slicePool ByteSlicePooler, cacheL
 		md5ValidationOption:     md5ValidationOption,
 		sourceMd5Exists:         sourceMd5Exists,
 		flushInterval:           int64(flushInterval),
-		currentAllocatedMem:     0,
+		currentCapacity:     0,
 		flushCount: 0,
 		dst: dst,
 		logger: logger,
@@ -168,7 +168,7 @@ func (w *chunkedFileWriter) WaitToScheduleChunk(ctx context.Context, id ChunkID,
 	w.chunkLogger.LogChunkStatus(id, EWaitReason.RAMToSchedule())
 	err := w.cacheLimiter.WaitUntilAdd(ctx, chunkSize, w.shouldUseRelaxedRamThreshold)
 	if err == nil {
-		atomic.AddInt64(&w.currentAllocatedMem, chunkSize)
+		atomic.AddInt64(&w.currentCapacity, chunkSize)
 		atomic.AddInt32(&w.activeChunkCount, 1)
 	}
 	return err
@@ -199,7 +199,7 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 		w.cacheLimiter.Remove(chunkSize) // remove this from the tally of scheduled-but-unsaved bytes
 		w.slicePool.ReturnSlice(buffer)
 		atomic.AddInt32(&w.activeChunkCount, -1)
-		atomic.AddInt64(&w.currentAllocatedMem, -chunkSize)
+		atomic.AddInt64(&w.currentCapacity, -chunkSize)
 		w.chunkLogger.LogChunkStatus(id, EWaitReason.ChunkDone()) // this chunk is all finished
 	}()
 	
@@ -240,8 +240,8 @@ func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	/* When flush finds active chunks, it is only those which have not rented a slice.
 	 * We clear accounted but unused memory here.
 	 */
-	w.logger.Log(pipeline.LogError, fmt.Sprintf("Flushing %s %d times. Cap: %d", w.dst, count, atomic.LoadInt64(&w.currentAllocatedMem)))
-	w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentAllocatedMem))
+	w.logger.Log(pipeline.LogError, fmt.Sprintf("Flushing %s %d times. Cap: %d", w.dst, count, atomic.LoadInt64(&w.currentCapacity)))
+	//w.cacheLimiter.Remove(atomic.LoadInt64(&w.currentCapacity))
 
 	// wait until all written to disk
 	select {
@@ -281,7 +281,7 @@ func (w *chunkedFileWriter) workerRoutine(ctx context.Context) {
 			w.cacheLimiter.Remove(int64(chunk.id.length)) // remove this from the tally of scheduled-but-unsaved bytes
 			w.slicePool.ReturnSlice(chunk.data)
 			atomic.AddInt32(&w.activeChunkCount, -1)
-			atomic.AddInt64(&w.currentAllocatedMem, -chunk.id.length)
+			atomic.AddInt64(&w.currentCapacity, -chunk.id.length)
 			w.chunkLogger.LogChunkStatus(chunk.id, EWaitReason.ChunkDone()) // this chunk is all finished
 		}
 	}()
@@ -385,7 +385,7 @@ func (w *chunkedFileWriter) saveOneChunk(chunk fileChunk, md5Hasher hash.Hash) e
 		w.cacheLimiter.Remove(int64(len(chunk.data))) // remove this from the tally of scheduled-but-unsaved bytes
 		w.slicePool.ReturnSlice(chunk.data)
 		atomic.AddInt32(&w.activeChunkCount, -1)
-		atomic.AddInt64(&w.currentAllocatedMem, -chunk.id.length)
+		atomic.AddInt64(&w.currentCapacity, -chunk.id.length)
 		w.chunkLogger.LogChunkStatus(chunk.id, EWaitReason.ChunkDone()) // this chunk is all finished
 	}()
 
