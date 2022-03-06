@@ -37,7 +37,7 @@ type Predicate func() bool
 type CacheLimiter interface {
 	TryAdd(count int64, useRelaxedLimit bool) (added bool)
 	WaitUntilAdd(ctx context.Context, count int64, useRelaxedLimit Predicate) error
-	Remove(count int64)
+	Remove(count int64) int64
 	Limit() int64
 }
 
@@ -101,9 +101,9 @@ func (c *cacheLimiter) WaitUntilAdd(ctx context.Context, count int64, useRelaxed
 	}
 }
 
-func (c *cacheLimiter) Remove(count int64) {
+func (c *cacheLimiter) Remove(count int64) int64 {
 	negativeDelta := -count
-	atomic.AddInt64(&c.value, negativeDelta)
+	return atomic.AddInt64(&c.value, negativeDelta)
 }
 
 func (c *cacheLimiter) Limit() int64 {

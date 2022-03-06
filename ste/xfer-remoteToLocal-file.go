@@ -336,7 +336,8 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 
 		// wait until all received chunks are flushed out
 		md5OfFileAsWritten, flushError, unusedCap := cw.Flush(jptm.Context())
-		jptm.Log(pipeline.LogError, fmt.Sprintf("Flushed %s. Cap: %d", info.Destination, unusedCap))
+		jptm.Log(pipeline.LogError, fmt.Sprintf("Flushed %s. Cap: %d. CacheLimiter: %d",
+			info.Destination, unusedCap, jptm.CacheLimiter().Remove(0)))
 		closeErr := activeDstFile.Close() // always try to close if, even if flush failed
 		if flushError != nil {
 			jptm.FailActiveDownload("Flushing file", flushError)
