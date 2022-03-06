@@ -48,7 +48,7 @@ type ChunkedFileWriter interface {
 
 	// Flush will block until all the chunks have been written to disk.  err will be non-nil if and only in any chunk failed to write.
 	// Flush must be called exactly once, after all chunks have been enqueued with EnqueueChunk.
-	Flush(ctx context.Context) (md5HashOfFileAsWritten []byte, err error)
+	Flush(ctx context.Context) (md5HashOfFileAsWritten []byte, err error, cap int64)
 
 	// MaxRetryPerDownloadBody returns the maximum number of retries that will be done for the download of a single chunk body
 	MaxRetryPerDownloadBody() int
@@ -214,7 +214,7 @@ func (w *chunkedFileWriter) EnqueueChunk(ctx context.Context, id ChunkID, chunkS
 }
 
 // Flush waits until all chunks have been flush to disk, then returns the MD5 has of the file's bytes-as-we-saved-them
-func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
+func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error, int64) {
 	// let worker know that no more will be coming
 	close(w.newUnorderedChunks)
 	
@@ -237,13 +237,13 @@ func (w *chunkedFileWriter) Flush(ctx context.Context) ([]byte, error) {
 	select {
 	case err := <-w.failureError:
 		if err != nil {
-			return nil, err
+			return nil, err, atomic.LoadInt64(&w.currentReservedCapacity)
 		}
-		return nil, ChunkWriterAlreadyFailed // channel returned nil because it was closed and empty
+		return nil, ChunkWriterAlreadyFailed, atomic.LoadInt64(&w.currentReservedCapacity) // channel returned nil because it was closed and empty
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, ctx.Err(), atomic.LoadInt64(&w.currentReservedCapacity)
 	case md5AtCompletion := <-w.successMd5:
-		return md5AtCompletion, nil
+		return md5AtCompletion, nil, atomic.LoadInt64(&w.currentReservedCapacity)
 	}
 }
 
