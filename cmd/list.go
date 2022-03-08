@@ -24,9 +24,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	pipeline2 "github.com/Azure/azure-pipeline-go/pipeline"
 	"strconv"
 	"strings"
+
+	pipeline2 "github.com/Azure/azure-pipeline-go/pipeline"
 
 	"github.com/spf13/cobra"
 
@@ -209,7 +210,7 @@ func (cooked cookedListCmdArgs) HandleListContainerCommand() (err error) {
 		return fmt.Errorf("failed to obtain credential info: %s", err.Error())
 	} else if cooked.location == cooked.location.File() && source.SAS == "" {
 		return errors.New("azure files requires a SAS token for authentication")
-	} else if credentialInfo.CredentialType == common.ECredentialType.OAuthToken() {
+	} else if credentialInfo.CredentialType.IsAzureOAuth() {
 		uotm := GetUserOAuthTokenManagerInstance()
 		if tokenInfo, err := uotm.GetTokenInfo(ctx); err != nil {
 			return err

@@ -653,13 +653,13 @@ func (cca *cookedSyncCmdArgs) process() (err error) {
 	}
 
 	// If the source wants OAuth and the destination doesn't, override the credential type because this could be a download, or oauth to SAS.
-	if srcCredInfo.CredentialType == common.ECredentialType.OAuthToken() && cca.credentialInfo.CredentialType != common.ECredentialType.OAuthToken() {
+	if srcCredInfo.CredentialType.IsAzureOAuth() && !cca.credentialInfo.CredentialType.IsAzureOAuth() {
 		cca.credentialInfo = srcCredInfo
 	}
 
 	// For OAuthToken credential, assign OAuthTokenInfo to CopyJobPartOrderRequest properly,
 	// the info will be transferred to STE.
-	if cca.credentialInfo.CredentialType == common.ECredentialType.OAuthToken() {
+	if cca.credentialInfo.CredentialType.IsAzureOAuth() {
 		uotm := GetUserOAuthTokenManagerInstance()
 		// Get token from env var or cache.
 		if tokenInfo, err := uotm.GetTokenInfo(ctx); err != nil {

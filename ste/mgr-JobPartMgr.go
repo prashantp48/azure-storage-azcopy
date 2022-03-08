@@ -155,7 +155,7 @@ func newAzcopyHTTPClientFactory(pipelineHTTPClient *http.Client) pipeline.Factor
 }
 
 // NewBlobPipeline creates a Pipeline using the specified credentials and options.
-func NewBlobPipeline(c azblob.Credential, o azblob.PipelineOptions, r XferRetryOptions, p pacer, client *http.Client, statsAcc *pipelineNetworkStats) pipeline.Pipeline {
+func NewBlobPipeline(c pipeline.Factory, o azblob.PipelineOptions, r XferRetryOptions, p pacer, client *http.Client, statsAcc *pipelineNetworkStats) pipeline.Pipeline {
 	if c == nil {
 		panic("c can't be nil")
 	}
