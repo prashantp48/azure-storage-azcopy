@@ -213,6 +213,8 @@ func initJobsAdmin(appCtx context.Context, concurrency ConcurrencySettings, targ
 	// the Channel and schedules the transfers of that JobPart.
 	go ja.scheduleJobParts()
 
+	go ja.messageHandler(common.GetLifecycleMgr().MsgHandlerChannel())
+
 	// In addition to the main pool (which is governed ja.poolSizer), we spin up a separate set of workers to process initiation of transfers
 	// (so that transfer initiation can't starve out progress on already-scheduled chunks.
 	// (Not sure whether that can really happen, but this protects against it anyway.)
@@ -785,6 +787,27 @@ func (ja *jobsAdmin) MessagesForJobLog() <-chan struct {
 	pipeline.LogLevel
 } {
 	return ja.workaroundJobLoggingChannel
+}
+
+func (ja *jobsAdmin) messageHandler(inputChan <-chan common.LcmMsgType) {
+	toBytes := func(mb int64) int64 {
+		return mb * 1024 * 1024
+	}
+	for {
+		msg := <-inputChan
+		msgType := common.MsgTypeMap[msg.MsgType]
+		switch msgType {
+		case common.EInputMsgType.ThroughputAdjustment():
+			newVal, err := strconv.Atoi(msg.Value)
+			if err != nil {
+				continue;
+			}
+			ja.UpdateTargetBandwidth(toBytes(int64(newVal)))
+		default:
+		}
+
+	}
+
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
