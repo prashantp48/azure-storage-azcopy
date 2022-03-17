@@ -113,6 +113,21 @@ func (lcm *lifecycleMgr) watchInputs() {
 			continue
 		}
 
+		//if we allow cancelFromStdin, the json messages will not be allowed
+		if lcm.allowCancelFromStdIn {
+			input, err := consoleReader.ReadString('\n')
+			if err != nil {
+				continue
+			}
+
+			msg := strings.TrimSpace(input)
+			if strings.EqualFold(msg, "cancel") {
+				lcm.cancelChannel <- os.Interrupt
+			}
+			continue
+		}
+
+		//First check if we need to prompt something
 		select {
 		case <-lcm.waitForUserResponse:
 			// reads input until the first occurrence of \n in the input,

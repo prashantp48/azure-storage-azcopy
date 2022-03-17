@@ -145,17 +145,12 @@ func initJobsAdmin(appCtx context.Context, concurrency ConcurrencySettings, targ
 
 	maxRamBytesToUse := getMaxRamForChunks()
 
-	// default to a pacer that doesn't actually control the rate
-	// (it just records total throughput, since for historical reasons we do that in the pacer)
-	var pacer pacerAdmin = newNullAutoPacer()
-	if targetRateInMegaBitsPerSec > 0 {
-		// use the "networking mega" (based on powers of 10, not powers of 2, since that's what mega means in networking context)
-		targetRateInBytesPerSec := int64(targetRateInMegaBitsPerSec * 1000 * 1000 / 8)
-		unusedExpectedCoarseRequestByteCount := int64(0)
-		pacer = newTokenBucketPacer(targetRateInBytesPerSec, unusedExpectedCoarseRequestByteCount)
-		// Note: as at July 2019, we don't currently have a shutdown method/event on JobsAdmin where this pacer
-		// could be shut down. But, it's global anyway, so we just leave it running until application exit.
-	}
+	// use the "networking mega" (based on powers of 10, not powers of 2, since that's what mega means in networking context)
+	targetRateInBytesPerSec := int64(targetRateInMegaBitsPerSec * 1000 * 1000 / 8)
+	unusedExpectedCoarseRequestByteCount := int64(0)
+	pacer := newTokenBucketPacer(targetRateInBytesPerSec, unusedExpectedCoarseRequestByteCount)
+	// Note: as at July 2019, we don't currently have a shutdown method/event on JobsAdmin where this pacer
+	// could be shut down. But, it's global anyway, so we just leave it running until application exit.
 
 	ja := &jobsAdmin{
 		concurrency:             concurrency,
