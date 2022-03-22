@@ -22,6 +22,7 @@ package ste
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -784,20 +785,52 @@ func (ja *jobsAdmin) MessagesForJobLog() <-chan struct {
 	return ja.workaroundJobLoggingChannel
 }
 
-func (ja *jobsAdmin) messageHandler(inputChan <-chan common.LcmMsgType) {
+
+//Structs for messageHandler
+
+/* PerfAdjustment message. */
+type jaPerfAdjustmentMsg struct {
+	Throughput int64 `json:"cap-mbps"`
+}
+
+func (ja *jobsAdmin) messageHandler(inputChan <-chan common.LCMMsg) {
 	toBitsPerSec := func(megaBitsPerSec int64) int64 {
 		return megaBitsPerSec * 1000 * 1000 / 8
 	}
+	glcm := common.GetLifecycleMgr()
+	
+	lastPerfAdjustTime := time.Now() // right when this routine songs
+	const minIntervalBetweenPerfAdjustment = time.Minute
+	
 	for {
 		msg := <-inputChan
-		msgType := common.MsgTypeMap[msg.MsgType]
+		var msgType common.LCMMsgType
+		msgType.Parse(msg.MsgType) // MsgType is already verified by LCM
 		switch msgType {
-		case common.EInputMsgType.ThroughputAdjustment():
-			newVal, err := strconv.Atoi(msg.Value)
-			if err != nil {
-				continue;
+		case common.ELCMMsgType.PerformanceAdjustment():
+			var perfAdjustmentReq jaPerfAdjustmentMsg
+
+			if time.Since(lastPerfAdjustTime) < minIntervalBetweenPerfAdjustment {
+				msgStr := "Performance Adjustment already in progress. Please try after some time."
+				glcm.Info(msgStr)
+				continue
 			}
-			ja.UpdateTargetBandwidth(toBitsPerSec(int64(newVal)))
+			
+			if err := json.Unmarshal([]byte(msg.Value), &perfAdjustmentReq); err != nil {
+				msgStr := fmt.Sprintf("Error parsing message %s. ERR: %s", msg.Value, err.Error())
+				glcm.Info(msgStr)
+				continue
+			}
+			
+			if perfAdjustmentReq.Throughput < 0 {
+				msgStr := fmt.Sprintf("Invalid value %d for cap-mbps. cap-mpbs should be greater than 0",
+						      perfAdjustmentReq.Throughput)
+				glcm.Info(msgStr)
+				continue
+			}
+
+			ja.UpdateTargetBandwidth(toBitsPerSec(perfAdjustmentReq.Throughput))
+			glcm.Info(fmt.Sprintf("Adjusted throughput to %dMbps",perfAdjustmentReq.Throughput))
 		default:
 		}
 
