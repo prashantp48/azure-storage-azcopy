@@ -30,7 +30,7 @@ var lcm = func() (lcmgr *lifecycleMgr) {
 		allowCancelFromStdIn: false,
 		allowWatchInput:      false,
 		closeFunc:            func() {}, // noop since we have nothing to do by default
-		msgHandlerChannel:    make(chan LcmMsgType),
+		msgHandlerChannel:    make(chan LCMMsg),
 	}
 
 	// kick off the single routine that processes output
@@ -70,7 +70,7 @@ type LifecycleMgr interface {
 	RegisterCloseFunc(func())
 	SetForceLogging()
 	IsForceLoggingDisabled() bool
-	MsgHandlerChannel()   <-chan LcmMsgType
+	MsgHandlerChannel()   <-chan LCMMsg
 }
 
 func GetLifecycleMgr() LifecycleMgr {
@@ -95,7 +95,7 @@ type lifecycleMgr struct {
 	closeFunc             func()         // used to close logs before exiting
 	disableSyslog         bool
 	waitForUserResponse   chan bool
-	msgHandlerChannel     chan LcmMsgType
+	msgHandlerChannel     chan LCMMsg
 }
 
 type userInput struct {
@@ -142,7 +142,7 @@ func (lcm *lifecycleMgr) watchInputs() {
 		default:
 		}
 
-		var msg LcmMsgType
+		var msg LCMMsg
 		decoder := json.NewDecoder(os.Stdin)
 		err := decoder.Decode(&msg)
 		if err != nil {
@@ -150,17 +150,17 @@ func (lcm *lifecycleMgr) watchInputs() {
 			continue
 		}
 
-		lcm.Info(fmt.Sprintf("Received Msg %s: %s %s", msg.TimeStamp.String(), msg.MsgType, msg.Value))
-		msgType, ok := MsgTypeMap[msg.MsgType]
-		if !ok {
+		lcm.Info(fmt.Sprintf("Received request for %s with timeStamp %s", msg.MsgType, msg.TimeStamp.String()))
+		var msgType LCMMsgType
+		if err := msgType.Parse(msg.MsgType); err != nil {
 			lcm.Info(fmt.Sprintf("Discarding incorrect message: %s.", msg.MsgType))
 			continue
 		}
 
 		switch msgType {
-		case EInputMsgType.CancelJob():
+		case ELCMMsgType.CancelJob():
 			lcm.cancelChannel <- os.Interrupt
-		case EInputMsgType.E2EInterrupts():
+		case ELCMMsgType.E2EInterrupts():
 			if lcm.e2eAllowAwaitContinue && strings.EqualFold(msg.Value, "continue") {
 				close(lcm.e2eContinueChannel)
 			} else if lcm.e2eAllowAwaitOpen && strings.EqualFold(msg.Value, "open") {
@@ -636,7 +636,7 @@ func (lcm *lifecycleMgr) IsForceLoggingDisabled() bool {
 	return lcm.disableSyslog
 }
 
-func (lcm *lifecycleMgr) MsgHandlerChannel() <-chan LcmMsgType {
+func (lcm *lifecycleMgr) MsgHandlerChannel() <-chan LCMMsg {
 	return lcm.msgHandlerChannel
 }
 

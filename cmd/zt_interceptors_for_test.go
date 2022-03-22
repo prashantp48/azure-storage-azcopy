@@ -167,7 +167,7 @@ func (*mockedLifecycleManager) GatherAllLogs(channel chan string) (result []stri
 	return
 }
 
-func (*mockedLifecycleManager) MsgHandlerChannel() <-chan common.LcmMsgType {
+func (*mockedLifecycleManager) MsgHandlerChannel() <-chan common.LCMMsg {
 	return nil
 }
 
