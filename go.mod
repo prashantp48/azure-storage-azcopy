@@ -19,6 +19,7 @@ require (
 	github.com/minio/minio-go v6.0.14+incompatible
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/pkg/errors v0.9.1
+	github.com/pkg/xattr v0.4.6
 	github.com/rogpeppe/go-internal v1.8.1 // indirect
 	github.com/spf13/cobra v1.4.0
 	github.com/stretchr/objx v0.3.0 // indirect
