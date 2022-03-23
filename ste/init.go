@@ -178,8 +178,11 @@ func ExecuteNewCopyJobPartOrder(order common.CopyJobPartOrderRequest) common.Cop
 		InMemoryTransitJobState{
 			credentialInfo: order.CredentialInfo,
 		})
-	// Supply no plan MMF because we don't have one, and AddJobPart will create one on its own.
-	jpm.AddJobPart(order.PartNum, jppfn, nil, order.SourceRoot.SAS, order.DestinationRoot.SAS, true) // Add this part to the Job and schedule its transfers
+
+	if !order.TraverserTest {
+		// Supply no plan MMF because we don't have one, and AddJobPart will create one on its own.
+		jpm.AddJobPart(order.PartNum, jppfn, nil, order.SourceRoot.SAS, order.DestinationRoot.SAS, true) // Add this part to the Job and schedule its transfers
+	}
 
 	// Update jobPart Status with the status Manager
 	jpm.SendJobPartCreatedMsg(jobPartCreatedMsg{totalTransfers: uint32(len(order.Transfers.List)),

@@ -1400,6 +1400,8 @@ func (cca *CookedCopyCmdArgs) processCopyJobPartOrders() (err error) {
 		cca.StripTopDir = true
 	}
 
+	jobPartOrder.TraverserTest = true
+
 	// depending on the source and destination type, we process the cp command differently
 	// Create enumerator and do enumerating
 	switch cca.FromTo {
@@ -1556,6 +1558,8 @@ func (cca *CookedCopyCmdArgs) ReportProgressOrExit(lcm common.LifecycleMgr) (tot
 	// if json is not desired, and job is done, then we generate a special end message to conclude the job
 	duration := time.Now().Sub(cca.jobStartTime) // report the total run time of the job
 
+	lcm.Info(fmt.Sprintf("Scanned %d items in %s", summary.FileTransfers, duration.String()))
+
 	if jobDone {
 		exitCode := cca.getSuccessExitCode()
 		if summary.TransfersFailed > 0 {
@@ -1647,6 +1651,7 @@ Final Job Status: %v%s%s
 			// display a scanning keyword if the job is not completely ordered
 			var scanningString = " (scanning...)"
 			if summary.CompleteJobOrdered {
+				lcm.Exit(nil, common.EExitCode.Success())
 				scanningString = ""
 			}
 

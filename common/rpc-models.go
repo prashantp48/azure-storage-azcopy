@@ -148,6 +148,7 @@ type CopyJobPartOrderRequest struct {
 	S2SInvalidMetadataHandleOption InvalidMetadataHandleOption
 	S2SPreserveBlobTags            bool
 	CpkOptions                     CpkOptions
+	TraverserTest                  bool
 }
 
 // CredentialInfo contains essential credential info which need be transited between modules,
