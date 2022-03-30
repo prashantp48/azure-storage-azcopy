@@ -73,7 +73,7 @@ func newRemoveEnumerator(cca *CookedCopyCmdArgs) (enumerator *CopyEnumerator, er
 	fpo, message := newFolderPropertyOption(cca.FromTo, cca.Recursive, cca.StripTopDir, filters, false, false, false)
 	// do not print Info message if in dry run mode
 	if !cca.dryrunMode {
-		glcm.Info(message)
+		// glcm.Info(message)
 	}
 	if ste.JobsAdmin != nil {
 		ste.JobsAdmin.LogToJobLog(message, pipeline.LogInfo)
