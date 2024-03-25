@@ -194,15 +194,14 @@ type clfsProgress struct {
 }
 
 func (progress clfsProgress) parseIntoString() string {
-	//return fmt.Sprintf("%.1f %%, %v Done, %v Failed, %v Pending, %v Skipped, %v Total, Throughput (Mb/s): %v",
-	//	progress.PercentComplete,
-	//	progress.FilesCompleted,
-	//	progress.FilesFailed,
-	//	progress.FilePending,
-	//	progress.FilesSkipped,
-	//	progress.FilesTotal,
-	//	progress.ThroughputMbps)
-	return fmt.Sprintf("Throughput (Mb/s): %v", progress.ThroughputMbps)
+	return fmt.Sprintf("%.1f %%, %v Done, %v Failed, %v Pending, %v Skipped, %v Total, Throughput (Mb/s): %v",
+		progress.PercentComplete,
+		progress.FilesCompleted,
+		progress.FilesFailed,
+		progress.FilePending,
+		progress.FilesSkipped,
+		progress.FilesTotal,
+		progress.ThroughputMbps)
 }
 
 type clfsSummary struct {

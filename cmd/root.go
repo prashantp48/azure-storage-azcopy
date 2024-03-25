@@ -249,25 +249,25 @@ func beginDetectNewVersion() chan struct{} {
 			return
 		}
 		// only take the first line, in case the version metadata file is upgraded in the future
-		// remoteVersion := strings.Split(buf.String(), "\n")[0]
+		remoteVersion := strings.Split(buf.String(), "\n")[0]
 
 		// step 5: compare remote version to local version to see if there's a newer AzCopy
-		//v1, err := NewVersion(common.AzcopyVersion)
-		//if err != nil {
-		//	return
-		//}
-		//v2, err := NewVersion(remoteVersion)
-		//if err != nil {
-		//	return
-		//}
+		v1, err := NewVersion(common.AzcopyVersion)
+		if err != nil {
+			return
+		}
+		v2, err := NewVersion(remoteVersion)
+		if err != nil {
+			return
+		}
 
-		//if v1.OlderThan(*v2) {
-			// executablePathSegments := strings.Split(strings.Replace(os.Args[0], "\\", "/", -1), "/")
-			// executableName := executablePathSegments[len(executablePathSegments)-1]
+		if v1.OlderThan(*v2) {
+			executablePathSegments := strings.Split(strings.Replace(os.Args[0], "\\", "/", -1), "/")
+			executableName := executablePathSegments[len(executablePathSegments)-1]
 
 			// output in info mode instead of stderr, as it was crashing CI jobs of some people
-			// glcm.Info(executableName + ": A newer version " + remoteVersion + " is available to download\n")
-		//}
+			glcm.Info(executableName + ": A newer version " + remoteVersion + " is available to download\n")
+		}
 
 		// let caller know we have finished, if they want to know
 		close(completionChannel)

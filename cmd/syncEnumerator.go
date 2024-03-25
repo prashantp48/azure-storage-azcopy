@@ -125,7 +125,7 @@ func (cca *cookedSyncCmdArgs) initEnumerator(ctx context.Context) (enumerator *s
 	// decide our folder transfer strategy
 	fpo, folderMessage := newFolderPropertyOption(cca.fromTo, cca.recursive, true, filters, cca.preserveSMBInfo, cca.preservePermissions.IsTruthy(), cca.isHNSToHNS) // sync always acts like stripTopDir=true
 	if !cca.dryrunMode {
-		// glcm.Info(folderMessage)
+		glcm.Info(folderMessage)
 	}
 	if ste.JobsAdmin != nil {
 		ste.JobsAdmin.LogToJobLog(folderMessage, pipeline.LogInfo)
