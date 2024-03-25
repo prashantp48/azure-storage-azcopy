@@ -21,6 +21,10 @@
 package ste
 
 import (
+	"bytes"
+	"crypto/md5"
+	"errors"
+	"io"
 	"os"
 	"time"
 
@@ -30,7 +34,11 @@ import (
 // Source info provider for local files
 type localFileSourceInfoProvider struct {
 	jptm         IJobPartTransferMgr
-	transferInfo TransferInfo
+	transferInfo *TransferInfo
+}
+
+func (f localFileSourceInfoProvider) ReadLink() (string, error) {
+	return os.Readlink(f.jptm.Info().Source)
 }
 
 func newLocalSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, error) {
@@ -63,6 +71,23 @@ func (f localFileSourceInfoProvider) IsLocal() bool {
 func (f localFileSourceInfoProvider) OpenSourceFile() (common.CloseableReaderAt, error) {
 	path := f.jptm.Info().Source
 
+	hasMode := func(fi os.FileInfo, mode os.FileMode) bool {
+		return fi.Mode()&mode == mode
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// These files have no data for us to upload, and will cause AzCopy to hang upon attempting to open.
+	if hasMode(fi, os.ModeNamedPipe) ||
+		hasMode(fi, os.ModeDevice) ||
+		hasMode(fi, os.ModeCharDevice) ||
+		hasMode(fi, os.ModeSocket) {
+		return emptyCloseableReaderAt{}, nil
+	}
+
 	if custom, ok := interface{}(f).(ICustomLocalOpener); ok {
 		return custom.Open(path)
 	}
@@ -79,4 +104,25 @@ func (f localFileSourceInfoProvider) GetFreshFileLastModifiedTime() (time.Time, 
 
 func (f localFileSourceInfoProvider) EntityType() common.EntityType {
 	return f.transferInfo.EntityType
+}
+
+func (f localFileSourceInfoProvider) GetMD5(offset, count int64) ([]byte, error) {
+	localFile, err := f.OpenSourceFile()
+	if err != nil {
+		return nil, err
+	}
+	defer localFile.Close()
+	data := make([]byte, count)
+	size, err := localFile.ReadAt(data, offset)
+	if err != nil {
+		return nil, err
+	}
+	if int64(size) != count {
+		return nil, errors.New("failed to read the full range of the local file")
+	}
+	h := md5.New()
+	if _, err = io.Copy(h, bytes.NewReader(data)); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }

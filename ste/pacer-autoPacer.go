@@ -27,7 +27,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
@@ -86,7 +85,7 @@ func newPageBlobAutoPacer(bytesPerSecond int64, expectedBytesPerRequest int64, i
 	if shouldPacePageBlobs {
 		return newAutoPacer(bytesPerSecond, expectedBytesPerRequest, isFair, logger, pageBlobThroughputTunerString)
 	}
-	return newNullAutoPacer()
+	return NewNullAutoPacer()
 }
 
 func newAutoPacer(bytesPerSecond int64, expectedBytesPerRequest int64, isFair bool, logger common.ILogger, logPrefix string) autopacer {
@@ -102,7 +101,7 @@ func newAutoPacer(bytesPerSecond int64, expectedBytesPerRequest int64, isFair bo
 	}
 
 	a := &autoTokenBucketPacer{
-		tokenBucketPacer:       newTokenBucketPacer(bytesPerSecond, expectedBytesPerRequest),
+		tokenBucketPacer:       NewTokenBucketPacer(bytesPerSecond, expectedBytesPerRequest),
 		lastPeakBytesPerSecond: float32(bytesPerSecond),
 		done:                   make(chan struct{}),
 		logger:                 logger,
@@ -121,7 +120,7 @@ func (a *autoTokenBucketPacer) Close() error {
 
 // RetryCallback records the fact that a retry has happened
 func (a *autoTokenBucketPacer) RetryCallback() {
-	a.logger.Log(pipeline.LogInfo, fmt.Sprintf("%s: ServerBusy (503) recorded", a.logPrefix))
+	a.logger.Log(common.LogInfo, fmt.Sprintf("%s: ServerBusy (503) recorded", a.logPrefix))
 	atomic.AddInt32(&a.atomicRetriesInInterval, 1)
 }
 
@@ -182,5 +181,5 @@ func (a *autoTokenBucketPacer) increaseRate() {
 }
 
 func (a *autoTokenBucketPacer) logRate() {
-	a.logger.Log(pipeline.LogInfo, fmt.Sprintf("%s: Target Mbps %d", a.logPrefix, (a.targetBytesPerSecond()*8)/(1000*1000)))
+	a.logger.Log(common.LogInfo, fmt.Sprintf("%s: Target Mbps %d", a.logPrefix, (a.targetBytesPerSecond()*8)/(1000*1000)))
 }

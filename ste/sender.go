@@ -22,10 +22,8 @@ package ste
 
 import (
 	"errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"time"
-
-	"github.com/Azure/azure-pipeline-go/pipeline"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -66,6 +64,17 @@ type sender interface {
 	GetDestinationLength() (int64, error)
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////////////
+// propertiesSender is a sender that can copy properties like metadata/tags/tier alone to
+// to destination instead of full copy
+//
+
+type propertiesSender interface {
+	sender
+
+	GenerateCopyMetadata(id common.ChunkID) chunkFunc
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // folderSender is a sender that also knows how to send folder property information
 /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -75,7 +84,28 @@ type folderSender interface {
 	DirUrlToString() string // This is only used in folder tracking, so this should trim the SAS token.
 }
 
-type senderFactory func(jptm IJobPartTransferMgr, destination string, p pipeline.Pipeline, pacer pacer, sip ISourceInfoProvider) (sender, error)
+// We wrote properties at creation time.
+type folderPropertiesSetInCreation struct{}
+
+func (f folderPropertiesSetInCreation) Error() string {
+	panic("Not a real error")
+}
+
+// ShouldSetProperties was called in creation and we got back a no.
+type folderPropertiesNotOverwroteInCreation struct{}
+
+func (f folderPropertiesNotOverwroteInCreation) Error() string {
+	panic("Not a real error")
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// symlinkSender is a sender that also knows how to send symlink properties
+/////////////////////////////////////////////////////////////////////////////////////////////////
+type symlinkSender interface {
+	SendSymlink(linkData string) error
+}
+
+type senderFactory func(jptm IJobPartTransferMgr, destination string, pacer pacer, sip ISourceInfoProvider) (sender, error)
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 // For copying folder properties, many of the ISender of the methods needed to copy one file from URL to a remote location
@@ -91,11 +121,8 @@ type s2sCopier interface {
 	GenerateCopyFunc(chunkID common.ChunkID, blockIndex int32, adjustedChunkSize int64, chunkIsWholeFile bool) chunkFunc
 }
 
-type s2sCopierFactory func(jptm IJobPartTransferMgr, srcInfoProvider IRemoteSourceInfoProvider, destination string, p pipeline.Pipeline, pacer pacer) (s2sCopier, error)
-
-/////////////////////////////////////////////////////////////////////////////////////////////////
 // Abstraction of the methods needed to upload one file to a remote location
-/////////////////////////////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////////////////////////
 type uploader interface {
 	sender
 
@@ -136,7 +163,7 @@ func getNumChunks(fileSize int64, chunkSize int64) uint32 {
 	numChunks := uint32(1) // we always map zero-size source files to ONE (empty) chunk
 	if fileSize > 0 {
 		chunkSizeI := chunkSize
-		numChunks = common.Iffuint32(
+		numChunks = common.Iff(
 			fileSize%chunkSizeI == 0,
 			uint32(fileSize/chunkSizeI),
 			uint32(fileSize/chunkSizeI)+1)
@@ -182,33 +209,39 @@ func createChunkFunc(setDoneStatusOnExit bool, jptm IJobPartTransferMgr, id comm
 }
 
 // newBlobUploader detects blob type and creates a uploader manually
-func newBlobUploader(jptm IJobPartTransferMgr, destination string, p pipeline.Pipeline, pacer pacer, sip ISourceInfoProvider) (sender, error) {
+func newBlobUploader(jptm IJobPartTransferMgr, destination string, pacer pacer, sip ISourceInfoProvider) (sender, error) {
 	override := jptm.BlobTypeOverride()
-	intendedType := override.ToAzBlobType()
+	intendedType := override.ToBlobType()
 
 	if override == common.EBlobType.Detect() {
-		intendedType = inferBlobType(jptm.Info().Source, azblob.BlobBlockBlob)
+		intendedType = inferBlobType(jptm.Info().Source, blob.BlobTypeBlockBlob)
 		// jptm.LogTransferInfo(fmt.Sprintf("Autodetected %s blob type as %s.", jptm.Info().Source , intendedType))
 		// TODO: Log these? @JohnRusk and @zezha-msft this creates quite a bit of spam in the logs but is important info.
 		// TODO: Perhaps we should log it only if it isn't a block blob?
 	}
 
+	if jptm.Info().IsFolderPropertiesTransfer() {
+		return newBlobFolderSender(jptm, destination, sip)
+	} else if jptm.Info().EntityType == common.EEntityType.Symlink() {
+		return newBlobSymlinkSender(jptm, destination, sip)
+	}
+
 	switch intendedType {
-	case azblob.BlobBlockBlob:
-		return newBlockBlobUploader(jptm, destination, p, pacer, sip)
-	case azblob.BlobPageBlob:
-		return newPageBlobUploader(jptm, destination, p, pacer, sip)
-	case azblob.BlobAppendBlob:
-		return newAppendBlobUploader(jptm, destination, p, pacer, sip)
+	case blob.BlobTypeBlockBlob:
+		return newBlockBlobUploader(jptm, destination, pacer, sip)
+	case blob.BlobTypePageBlob:
+		return newPageBlobUploader(jptm, destination, pacer, sip)
+	case blob.BlobTypeAppendBlob:
+		return newAppendBlobUploader(jptm, destination, pacer, sip)
 	default:
-		return newBlockBlobUploader(jptm, destination, p, pacer, sip) // If no blob type was inferred, assume block blob.
+		return newBlockBlobUploader(jptm, destination, pacer, sip) // If no blob type was inferred, assume block blob.
 	}
 }
 
 const TagsHeaderMaxLength = 2000
 
 // If length of tags <= 2kb, pass it in the header x-ms-tags. Else do a separate SetTags call
-func separateSetTagsRequired(tagsMap azblob.BlobTagsMap) bool {
+func separateSetTagsRequired(tagsMap common.BlobTags) bool {
 	tagsLength := 0
 	for k, v := range tagsMap {
 		tagsLength += len(k) + len(v) + 2

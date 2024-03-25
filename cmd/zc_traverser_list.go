@@ -23,7 +23,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"net/url"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
@@ -40,14 +39,15 @@ type listTraverser struct {
 type childTraverserGenerator func(childPath string) (ResourceTraverser, error)
 
 // There is no impact to a list traverser returning false because a list traverser points directly to relative paths.
-func (l *listTraverser) IsDirectory(bool) bool {
-	return false
+func (l *listTraverser) IsDirectory(bool) (bool, error) {
+	return false, nil
 }
 
 // To kill the traverser, close() the channel under it.
 // Behavior demonstrated: https://play.golang.org/p/OYdvLmNWgwO
 func (l *listTraverser) Traverse(preprocessor objectMorpher, processor objectProcessor, filters []ObjectFilter) (err error) {
 	// read a channel until it closes to get a list of objects
+
 	childPath, ok := <-l.listReader
 	for ; ok; childPath, ok = <-l.listReader {
 
@@ -59,9 +59,10 @@ func (l *listTraverser) Traverse(preprocessor objectMorpher, processor objectPro
 			glcm.Info(fmt.Sprintf("Skipping %s due to error %s", childPath, err))
 			continue
 		}
-
 		// listTraverser will only ever execute on the source
-		if !l.recursive && childTraverser.IsDirectory(true) {
+
+		isDir, _ := childTraverser.IsDirectory(true)
+		if !l.recursive && isDir {
 			continue // skip over directories
 		}
 
@@ -89,12 +90,11 @@ func (l *listTraverser) Traverse(preprocessor objectMorpher, processor objectPro
 }
 
 func newListTraverser(parent common.ResourceString, parentType common.Location, credential *common.CredentialInfo,
-	ctx *context.Context, recursive, followSymlinks, getProperties bool, listChan chan string,
+	ctx *context.Context, recursive bool, handleSymlinks common.SymlinkHandlingType, getProperties bool, listChan chan string,
 	includeDirectoryStubs bool, incrementEnumerationCounter enumerationCounterFunc, s2sPreserveBlobTags bool,
-	logLevel pipeline.LogLevel, cpkOptions common.CpkOptions) ResourceTraverser {
-	var traverserGenerator childTraverserGenerator
+	logLevel common.LogLevel, cpkOptions common.CpkOptions, syncHashType common.SyncHashType, preservePermissions common.PreservePermissionsOption, trailingDot common.TrailingDotOption, destination *common.Location) ResourceTraverser {
 
-	traverserGenerator = func(relativeChildPath string) (ResourceTraverser, error) {
+	traverserGenerator := func(relativeChildPath string) (ResourceTraverser, error) {
 		source := parent.Clone()
 		if parentType != common.ELocation.Local() {
 			// assume child path is not URL-encoded yet, this is consistent with the behavior of previous implementation
@@ -107,9 +107,7 @@ func newListTraverser(parent common.ResourceString, parentType common.Location, 
 		}
 
 		// Construct a traverser that goes through the child
-		traverser, err := InitResourceTraverser(source, parentType, ctx, credential, &followSymlinks,
-			nil, recursive, getProperties, includeDirectoryStubs, common.EPermanentDeleteOption.None(), incrementEnumerationCounter,
-			nil, s2sPreserveBlobTags, logLevel, cpkOptions)
+		traverser, err := InitResourceTraverser(source, parentType, ctx, credential, handleSymlinks, nil, recursive, getProperties, includeDirectoryStubs, common.EPermanentDeleteOption.None(), incrementEnumerationCounter, nil, s2sPreserveBlobTags, syncHashType, preservePermissions, logLevel, cpkOptions, nil, false, trailingDot, destination, nil)
 		if err != nil {
 			return nil, err
 		}

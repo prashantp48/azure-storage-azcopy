@@ -1,15 +1,16 @@
 package e2etest
 
 import (
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"testing"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/google/uuid"
 )
 
 func TestResume_Generic(t *testing.T) {
-	RunScenarios(t, eOperation.CopyAndSync()|eOperation.Resume(), eTestFromTo.AllSync(), eValidate.Auto(), params{
+	RunScenarios(t, eOperation.CopyAndSync()|eOperation.Resume(), eTestFromTo.AllSync(), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive: true,
 		debugSkipFiles: []string{
 			"/fileb",
@@ -59,7 +60,7 @@ func TestResume_LargeGeneric(t *testing.T) {
 		t.FailNow()
 	}
 
-	RunScenarios(t, eOperation.CopyAndSync()|eOperation.Resume(), eTestFromTo.AllSync(), eValidate.Auto(), params{
+	RunScenarios(t, eOperation.CopyAndSync()|eOperation.Resume(), eTestFromTo.Other(common.EFromTo.BlobBlob()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive:      true,
 		debugSkipFiles: toSkip,
 	}, nil, testFiles{
@@ -78,6 +79,8 @@ func TestResume_PublicSource_BlobTarget(t *testing.T) {
 		eOperation.Copy()|eOperation.Resume(),
 		eTestFromTo.Other(common.EFromTo.BlobBlob(), common.EFromTo.BlobLocal()),
 		eValidate.Auto(),
+		anonymousAuthOnly,
+		anonymousAuthOnly,
 		params{
 			recursive:      true,
 			debugSkipFiles: []string{";"}, // skip the only file is ;
@@ -85,8 +88,8 @@ func TestResume_PublicSource_BlobTarget(t *testing.T) {
 		nil,
 		testFiles{
 			defaultSize:  "1K",
-			sourcePublic: azblob.PublicAccessBlob,
-			objectTarget: "a.txt",
+			sourcePublic: to.Ptr(container.PublicAccessTypeBlob),
+			objectTarget: objectTarget{objectName: "a.txt"},
 
 			shouldTransfer: []interface{}{
 				f("a.txt"),
@@ -102,6 +105,8 @@ func TestResume_PublicSource_ContainerTarget(t *testing.T) {
 		eOperation.CopyAndSync()|eOperation.Resume(),
 		eTestFromTo.Other(common.EFromTo.BlobBlob(), common.EFromTo.BlobLocal()),
 		eValidate.Auto(),
+		anonymousAuthOnly,
+		anonymousAuthOnly,
 		params{
 			recursive:      true,
 			debugSkipFiles: []string{"a.txt"}, // skip the only file is ;
@@ -109,7 +114,7 @@ func TestResume_PublicSource_ContainerTarget(t *testing.T) {
 		nil,
 		testFiles{
 			defaultSize:  "1K",
-			sourcePublic: azblob.PublicAccessContainer,
+			sourcePublic: to.Ptr(container.PublicAccessTypeContainer),
 
 			shouldTransfer: []interface{}{
 				f("a.txt"),

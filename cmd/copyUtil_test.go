@@ -21,61 +21,119 @@
 package cmd
 
 import (
-	chk "gopkg.in/check.v1"
-	"net/url"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-storage-azcopy/v10/common"
+	"github.com/stretchr/testify/assert"
+	"testing"
 )
 
-type copyUtilTestSuite struct{}
-
-var _ = chk.Suite(&copyUtilTestSuite{})
-
-func (s *copyUtilTestSuite) TestUrlIsContainerOrBlob(c *chk.C) {
+func TestUrlIsContainerOrBlob(t *testing.T) {
+	a := assert.New(t)
 	util := copyHandlerUtil{}
 
-	testUrl := url.URL{Path: "/container/dir1"}
-	isContainer := util.urlIsContainerOrVirtualDirectory(&testUrl)
-	c.Assert(isContainer, chk.Equals, false)
+	testUrl := "https://fakeaccount.core.windows.net/container/dir1"
+	isContainer := util.urlIsContainerOrVirtualDirectory(testUrl)
+	a.False(isContainer)
 
-	testUrl.Path = "/container/dir1/dir2"
-	isContainer = util.urlIsContainerOrVirtualDirectory(&testUrl)
-	c.Assert(isContainer, chk.Equals, false)
+	testUrl = "https://fakeaccount.core.windows.net/container/dir1/dir2"
+	isContainer = util.urlIsContainerOrVirtualDirectory(testUrl)
+	a.False(isContainer)
 
-	testUrl.Path = "/container/"
-	isContainer = util.urlIsContainerOrVirtualDirectory(&testUrl)
-	c.Assert(isContainer, chk.Equals, true)
+	testUrl = "https://fakeaccount.core.windows.net/container/"
+	isContainer = util.urlIsContainerOrVirtualDirectory(testUrl)
+	a.True(isContainer)
 
-	testUrl.Path = "/container"
-	isContainer = util.urlIsContainerOrVirtualDirectory(&testUrl)
-	c.Assert(isContainer, chk.Equals, true)
+	testUrl = "https://fakeaccount.core.windows.net/container"
+	isContainer = util.urlIsContainerOrVirtualDirectory(testUrl)
+	a.True(isContainer)
 
 	// root container
-	testUrl.Path = "/"
-	isContainer = util.urlIsContainerOrVirtualDirectory(&testUrl)
-	c.Assert(isContainer, chk.Equals, true)
+	testUrl = "https://fakeaccount.core.windows.net/"
+	isContainer = util.urlIsContainerOrVirtualDirectory(testUrl)
+	a.True(isContainer)
 }
 
-func (s *copyUtilTestSuite) TestIPIsContainerOrBlob(c *chk.C) {
+func TestIPIsContainerOrBlob(t *testing.T) {
+	a := assert.New(t)
 	util := copyHandlerUtil{}
 
-	testIP := url.URL{Host: "127.0.0.1:8256", Path: "/account/container"}
-	testURL := url.URL{Path: "/account/container"}
-	isContainerIP := util.urlIsContainerOrVirtualDirectory(&testIP)
-	isContainerURL := util.urlIsContainerOrVirtualDirectory(&testURL)
-	c.Assert(isContainerIP, chk.Equals, true)   // IP endpoints contain the account in the path, making the container the second entry
-	c.Assert(isContainerURL, chk.Equals, false) // URL endpoints do not contain the account in the path, making the container the first entry.
+	testIP := "https://127.0.0.1:8256/account/container"
+	testURL := "https://fakeaccount.core.windows.net/account/container"
+	isContainerIP := util.urlIsContainerOrVirtualDirectory(testIP)
+	isContainerURL := util.urlIsContainerOrVirtualDirectory(testURL)
+	a.True(isContainerIP)   // IP endpoints contain the account in the path, making the container the second entry
+	a.False(isContainerURL) // URL endpoints do not contain the account in the path, making the container the first entry.
 
-	testURL.Path = "/account/container/folder"
-	testIP.Path = "/account/container/folder"
-	isContainerIP = util.urlIsContainerOrVirtualDirectory(&testIP)
-	isContainerURL = util.urlIsContainerOrVirtualDirectory(&testURL)
-	c.Assert(isContainerIP, chk.Equals, false)  // IP endpoints contain the account in the path, making the container the second entry
-	c.Assert(isContainerURL, chk.Equals, false) // URL endpoints do not contain the account in the path, making the container the first entry.
+	testIP = "https://127.0.0.1:8256/account/container/folder"
+	testURL = "https://fakeaccount.core.windows.net/account/container/folder"
+	isContainerIP = util.urlIsContainerOrVirtualDirectory(testIP)
+	isContainerURL = util.urlIsContainerOrVirtualDirectory(testURL)
+	a.False(isContainerIP)  // IP endpoints contain the account in the path, making the container the second entry
+	a.False(isContainerURL) // URL endpoints do not contain the account in the path, making the container the first entry.
 
-	testURL.Path = "/account/container/folder/"
-	testIP.Path = "/account/container/folder/"
-	isContainerIP = util.urlIsContainerOrVirtualDirectory(&testIP)
-	isContainerURL = util.urlIsContainerOrVirtualDirectory(&testURL)
-	c.Assert(isContainerIP, chk.Equals, true)  // IP endpoints contain the account in the path, making the container the second entry
-	c.Assert(isContainerURL, chk.Equals, true) // URL endpoints do not contain the account in the path, making the container the first entry.
+	testIP = "https://127.0.0.1:8256/account/container/folder/"
+	testURL = "https://fakeaccount.core.windows.net/account/container/folder/"
+	isContainerIP = util.urlIsContainerOrVirtualDirectory(testIP)
+	isContainerURL = util.urlIsContainerOrVirtualDirectory(testURL)
+	a.True(isContainerIP)  // IP endpoints contain the account in the path, making the container the second entry
+	a.True(isContainerURL) // URL endpoints do not contain the account in the path, making the container the first entry.
 	// The behaviour isn't too different from here.
+}
+
+func TestDoesBlobRepresentAFolder(t *testing.T) {
+	a := assert.New(t)
+	util := copyHandlerUtil{}
+
+	// Test case 1: metadata is empty
+	metadata := make(common.Metadata)
+	ok := util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
+
+	// Test case 2: metadata contains exact key
+	metadata = make(common.Metadata)
+	metadata["hdi_isfolder"] = to.Ptr("true")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.True(ok)
+
+	metadata = make(common.Metadata)
+	metadata["hdi_isfolder"] = to.Ptr("True")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.True(ok)
+
+	metadata = make(common.Metadata)
+	metadata["hdi_isfolder"] = to.Ptr("false")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
+
+	metadata = make(common.Metadata)
+	metadata["hdi_isfolder"] = to.Ptr("other_value")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
+
+	// Test case 3: metadata contains key with different case
+	metadata = make(common.Metadata)
+	metadata["Hdi_isfolder"] = to.Ptr("true")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.True(ok)
+
+	metadata = make(common.Metadata)
+	metadata["Hdi_isfolder"] = to.Ptr("True")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.True(ok)
+
+	metadata = make(common.Metadata)
+	metadata["Hdi_isfolder"] = to.Ptr("false")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
+
+	metadata = make(common.Metadata)
+	metadata["Hdi_isfolder"] = to.Ptr("other_value")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
+
+	// Test case 4: metadata is not empty and does not contain key
+	metadata = make(common.Metadata)
+	metadata["other_key"] = to.Ptr("value")
+	ok = util.doesBlobRepresentAFolder(metadata)
+	a.False(ok)
 }

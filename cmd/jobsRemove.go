@@ -23,7 +23,6 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"strings"
@@ -75,7 +74,7 @@ func init() {
 
 func handleRemoveSingleJob(jobID common.JobID) error {
 	// get rid of the job plan files
-	numPlanFileRemoved, err := removeFilesWithPredicate(azcopyJobPlanFolder, func(s string) bool {
+	numPlanFileRemoved, err := removeFilesWithPredicate(common.AzcopyJobPlanFolder, func(s string) bool {
 		if strings.Contains(s, jobID.String()) && strings.Contains(s, ".steV") {
 			return true
 		}
@@ -108,7 +107,7 @@ func handleRemoveSingleJob(jobID common.JobID) error {
 // remove all files whose names are approved by the predicate in the targetFolder
 func removeFilesWithPredicate(targetFolder string, predicate func(string) bool) (int, error) {
 	count := 0
-	files, err := ioutil.ReadDir(targetFolder)
+	files, err := os.ReadDir(targetFolder)
 	if err != nil {
 		return count, err
 	}

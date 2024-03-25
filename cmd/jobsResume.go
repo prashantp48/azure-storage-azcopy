@@ -28,6 +28,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-storage-azcopy/v10/jobsAdmin"
+
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/ste"
 	"github.com/spf13/cobra"
@@ -92,35 +95,7 @@ func (cca *resumeJobController) ReportProgressOrExit(lcm common.LifecycleMgr) (t
 	totalKnownCount = summary.TotalTransfers
 
 	// if json is not desired, and job is done, then we generate a special end message to conclude the job
-	duration := time.Now().Sub(cca.jobStartTime) // report the total run time of the job
-
-	if jobDone {
-		exitCode := common.EExitCode.Success()
-		if summary.TransfersFailed > 0 {
-			exitCode = common.EExitCode.Error()
-		}
-
-		lcm.Exit(func(format common.OutputFormat) string {
-			if format == common.EOutputFormat.Json() {
-				jsonOutput, err := json.Marshal(summary)
-				common.PanicIfErr(err)
-				return string(jsonOutput)
-			} else {
-				return fmt.Sprintf(
-					"\n\nJob %s summary\nElapsed Time (Minutes): %v\nNumber of File Transfers: %v\nNumber of Folder Property Transfers: %v\nTotal Number Of Transfers: %v\nNumber of Transfers Completed: %v\nNumber of Transfers Failed: %v\nNumber of Transfers Skipped: %v\nTotalBytesTransferred: %v\nFinal Job Status: %v\n",
-					summary.JobID.String(),
-					ste.ToFixed(duration.Minutes(), 4),
-					summary.FileTransfers,
-					summary.FolderPropertyTransfers,
-					summary.TotalTransfers,
-					summary.TransfersCompleted,
-					summary.TransfersFailed,
-					summary.TransfersSkipped,
-					summary.TotalBytesTransferred,
-					summary.JobStatus)
-			}
-		}, exitCode)
-	}
+	duration := time.Since(cca.jobStartTime) // report the total run time of the job
 
 	var computeThroughput = func() float64 {
 		// compute the average throughput for the last time interval
@@ -131,7 +106,7 @@ func (cca *resumeJobController) ReportProgressOrExit(lcm common.LifecycleMgr) (t
 		cca.intervalStartTime = time.Now()
 		cca.intervalBytesTransferred = summary.BytesOverWire
 
-		return common.Iffloat64(timeElapsed != 0, bytesInMb/timeElapsed, 0) * 8
+		return common.Iff(timeElapsed != 0, bytesInMb/timeElapsed, 0) * 8
 	}
 
 	glcm.Progress(func(format common.OutputFormat) string {
@@ -148,7 +123,7 @@ func (cca *resumeJobController) ReportProgressOrExit(lcm common.LifecycleMgr) (t
 			}
 
 			throughput := computeThroughput()
-			throughputString := fmt.Sprintf("2-sec Throughput (Mb/s): %v", ste.ToFixed(throughput, 4))
+			throughputString := fmt.Sprintf("2-sec Throughput (Mb/s): %v", jobsAdmin.ToFixed(throughput, 4))
 			if throughput == 0 {
 				// As there would be case when no bits sent from local, e.g. service side copy, when throughput = 0, hide it.
 				throughputString = ""
@@ -165,6 +140,55 @@ func (cca *resumeJobController) ReportProgressOrExit(lcm common.LifecycleMgr) (t
 				summary.TransfersSkipped, summary.TotalTransfers, scanningString, perfString, throughputString, diskString)
 		}
 	})
+
+	if jobDone {
+		exitCode := common.EExitCode.Success()
+		if summary.TransfersFailed > 0 {
+			exitCode = common.EExitCode.Error()
+		}
+
+		lcm.Exit(func(format common.OutputFormat) string {
+			if format == common.EOutputFormat.Json() {
+				jsonOutput, err := json.Marshal(summary)
+				common.PanicIfErr(err)
+				return string(jsonOutput)
+			} else {
+				return fmt.Sprintf(
+					`
+
+Job %s summary
+Elapsed Time (Minutes): %v
+Number of File Transfers: %v
+Number of Folder Property Transfers: %v
+Number of Symlink Transfers: %v
+Total Number Of Transfers: %v
+Number of File Transfers Completed: %v
+Number of Folder Transfers Completed: %v
+Number of File Transfers Failed: %v
+Number of Folder Transfers Failed: %v
+Number of File Transfers Skipped: %v
+Number of Folder Transfers Skipped: %v
+TotalBytesTransferred: %v
+Final Job Status: %v
+`,
+					summary.JobID.String(),
+					jobsAdmin.ToFixed(duration.Minutes(), 4),
+					summary.FileTransfers,
+					summary.FolderPropertyTransfers,
+					summary.SymlinkTransfers,
+					summary.TotalTransfers,
+					summary.TransfersCompleted-summary.FoldersCompleted,
+					summary.FoldersCompleted,
+					summary.TransfersFailed-summary.FoldersFailed,
+					summary.FoldersFailed,
+					summary.TransfersSkipped-summary.FoldersSkipped,
+					summary.FoldersSkipped,
+					summary.TotalBytesTransferred,
+					summary.JobStatus)
+			}
+		}, exitCode)
+	}
+
 	return
 }
 
@@ -186,6 +210,11 @@ func init() {
 				return errors.New("this command requires jobId to be passed as argument")
 			}
 			resumeCmdArgs.jobID = args[0]
+
+			glcm.EnableInputWatcher()
+			if cancelFromStdin {
+				glcm.EnableCancelFromStdIn()
+			}
 			return nil
 		},
 		Run: func(cmd *cobra.Command, args []string) {
@@ -214,6 +243,74 @@ type resumeCmdArgs struct {
 
 	SourceSAS      string
 	DestinationSAS string
+}
+
+func (rca resumeCmdArgs) getSourceAndDestinationServiceClients(
+	ctx context.Context,
+	fromTo common.FromTo,
+	source string,
+	destination string,
+) (*common.ServiceClient, *common.ServiceClient, error) {
+	if len(rca.SourceSAS) > 0 && rca.SourceSAS[0] != '?' {
+		rca.SourceSAS = "?" + rca.SourceSAS
+	}
+	if len(rca.DestinationSAS) > 0 && rca.DestinationSAS[0] != '?' {
+		rca.DestinationSAS = "?" + rca.DestinationSAS
+	}
+
+	srcCredType, _, err := getCredentialTypeForLocation(ctx,
+		fromTo.From(),
+		source,
+		rca.SourceSAS,
+		true,
+		common.CpkOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dstCredType, _, err := getCredentialTypeForLocation(ctx,
+		fromTo.To(),
+		destination,
+		rca.DestinationSAS,
+		false,
+		common.CpkOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var tc azcore.TokenCredential
+	if srcCredType.IsAzureOAuth() || dstCredType.IsAzureOAuth() {
+		uotm := GetUserOAuthTokenManagerInstance()
+		// Get token from env var or cache.
+		tokenInfo, err := uotm.GetTokenInfo(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		tc, err = tokenInfo.GetTokenCredential()
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	options := createClientOptions(common.AzcopyCurrentJobLogger, nil)
+
+	srcServiceClient, err := common.GetServiceClientForLocation(fromTo.From(), source+rca.SourceSAS, srcCredType, tc, &options, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var srcCred *common.ScopedCredential
+	if fromTo.IsS2S() && srcCredType.IsAzureOAuth() {
+		srcCred = common.NewScopedCredential(tc, srcCredType)
+	}
+	options = createClientOptions(common.AzcopyCurrentJobLogger, srcCred)
+	dstServiceClient, err := common.GetServiceClientForLocation(fromTo.To(), destination+rca.DestinationSAS, dstCredType, tc, &options, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return srcServiceClient, dstServiceClient, nil
 }
 
 // processes the resume command,
@@ -278,6 +375,9 @@ func (rca resumeCmdArgs) process() error {
 	// Initialize credential info.
 	credentialInfo := common.CredentialInfo{}
 	// TODO: Replace context with root context
+
+	// we should stop using credentiaLInfo and use the clients instead. But before we fix
+	// that there will be repeated calls to get Credential type for correctness.
 	if credentialInfo.CredentialType, err = getCredentialType(ctx, rawFromToInfo{
 		fromTo:         getJobFromToResponse.FromTo,
 		source:         getJobFromToResponse.Source,
@@ -286,26 +386,28 @@ func (rca resumeCmdArgs) process() error {
 		destinationSAS: rca.DestinationSAS,
 	}, common.CpkOptions{}); err != nil {
 		return err
-	} else if credentialInfo.CredentialType == common.ECredentialType.OAuthToken() {
-		uotm := GetUserOAuthTokenManagerInstance()
-		// Get token from env var or cache.
-		if tokenInfo, err := uotm.GetTokenInfo(ctx); err != nil {
-			return err
-		} else {
-			credentialInfo.OAuthTokenInfo = *tokenInfo
-		}
 	}
 
+	srcServiceClient, dstServiceClient, err := rca.getSourceAndDestinationServiceClients(
+		ctx, getJobFromToResponse.FromTo,
+		getJobFromToResponse.Source,
+		getJobFromToResponse.Destination,
+	)
+	if err != nil {
+		return errors.New("could not create service clients " + err.Error())
+	}
 	// Send resume job request.
 	var resumeJobResponse common.CancelPauseResumeResponse
 	Rpc(common.ERpcCmd.ResumeJob(),
 		&common.ResumeJobRequest{
-			JobID:           jobID,
-			SourceSAS:       rca.SourceSAS,
-			DestinationSAS:  rca.DestinationSAS,
-			CredentialInfo:  credentialInfo,
-			IncludeTransfer: includeTransfer,
-			ExcludeTransfer: excludeTransfer,
+			JobID:            jobID,
+			SourceSAS:        rca.SourceSAS,
+			DestinationSAS:   rca.DestinationSAS,
+			SrcServiceClient: srcServiceClient,
+			DstServiceClient: dstServiceClient,
+			CredentialInfo:   credentialInfo,
+			IncludeTransfer:  includeTransfer,
+			ExcludeTransfer:  excludeTransfer,
 		},
 		&resumeJobResponse)
 

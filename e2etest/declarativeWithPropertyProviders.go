@@ -21,6 +21,7 @@
 package e2etest
 
 import (
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"time"
 
 	"github.com/Azure/azure-storage-azcopy/v10/cmd"
@@ -36,6 +37,10 @@ import (
 type with struct {
 	size string // uses our standard K, M, G suffix
 
+	symlinkTarget string
+
+	posixProperties objectUnixStatContainer
+
 	cacheControl       string
 	contentDisposition string
 	contentEncoding    string
@@ -43,9 +48,12 @@ type with struct {
 	contentType        string
 	contentMD5         []byte
 
-	nameValueMetadata  map[string]string
-	blobTags           string
-	blobType           common.BlobType
+	nameValueMetadata map[string]*string
+	blobTags          string
+	blobType          common.BlobType
+	// blobVersions is a list of strings defining the data stored inside the object's body.
+	// These versions are treated as a key, as well, and correspond to the version IDs Azure assigns.
+	blobVersions       uint
 	lastWriteTime      time.Time
 	creationTime       time.Time
 	smbAttributes      uint32
@@ -83,6 +91,10 @@ func (w with) createObjectProperties() *objectProperties {
 	}
 
 	// content headers
+	if w.symlinkTarget != "" {
+		populated = true
+		result.symlinkTarget = &w.symlinkTarget
+	}
 	if w.cacheControl != "" {
 		populated = true
 		ensureContentPropsExist()
@@ -128,6 +140,10 @@ func (w with) createObjectProperties() *objectProperties {
 		populated = true
 		result.blobType = w.blobType
 	}
+	if w.blobVersions > 0 {
+		populated = true
+		result.blobVersions = &w.blobVersions
+	}
 	if w.lastWriteTime != (time.Time{}) {
 		populated = true
 		result.lastWriteTime = &w.lastWriteTime
@@ -148,17 +164,21 @@ func (w with) createObjectProperties() *objectProperties {
 		populated = true
 		result.adlsPermissionsACL = &w.adlsPermissionsACL
 	}
+	if !w.posixProperties.Empty() {
+		populated = true
+		result.posixProperties = &w.posixProperties
+	}
 
 	if w.cpkByName != "" {
 		populated = true
 		cpkScopeInfo := common.GetCpkScopeInfo(w.cpkByName)
-		result.cpkScopeInfo = &cpkScopeInfo
+		result.cpkScopeInfo = cpkScopeInfo
 	}
 
 	if w.cpkByValue {
 		populated = true
 		cpkInfo := common.GetCpkInfo(w.cpkByValue)
-		result.cpkInfo = &cpkInfo
+		result.cpkInfo = cpkInfo
 	}
 
 	if populated {
@@ -173,12 +193,10 @@ func (w with) createObjectProperties() *objectProperties {
 // use createOnly if you want to define properties that should be used when creating an object, but not
 // used when verifying the state of the transferred object. Generally you'll have no use for this.
 // Just use "with", and the test framework will do the right thing.
-//nolint
 type createOnly struct {
 	with
 }
 
-//nolint
 func (createOnly) appliesToVerification() bool {
 	return false
 }
@@ -186,7 +204,7 @@ func (createOnly) appliesToVerification() bool {
 ////
 
 // Use verifyOnly if you need to specify some properties that should NOT be applied to the file when it is created,
-// but should be present on it afte) the transfer
+// but should be present on it after) the transfer
 type verifyOnly struct {
 	with
 }
@@ -209,7 +227,7 @@ func (withDirStubMetadata) appliesToVerification() bool {
 }
 
 func (withDirStubMetadata) createObjectProperties() *objectProperties {
-	m := map[string]string{"hdi_isfolder": "true"} // special flag that says this file is a stub
+	m := map[string]*string{"hdi_isfolder": to.Ptr("true")} // special flag that says this file is a stub
 	size := int64(0)
 	return &objectProperties{
 		size:              &size,
@@ -224,7 +242,8 @@ func (withDirStubMetadata) createObjectProperties() *objectProperties {
 // use withError ONLY on files in the shouldFail section.
 // It allows you to say what the error should be
 // TODO: as at 1 July 2020, we are not actually validating these.  Should we? It could be nice.  If we don't,
-//   remove this type and its usages, and the expectedFailureProvider interface
+//
+//	remove this type and its usages, and the expectedFailureProvider interface
 type withError struct {
 	msg string
 }

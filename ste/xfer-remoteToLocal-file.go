@@ -21,6 +21,7 @@
 package ste
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -28,7 +29,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
@@ -36,23 +36,30 @@ const azcopyTempDownloadPrefix string = ".azDownload-%s-"
 
 // xfer.go requires just a single xfer function for the whole job.
 // This routine serves that role for downloads and redirects for each transfer to a file or folder implementation
-func remoteToLocal(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, df downloaderFactory) {
+func remoteToLocal(jptm IJobPartTransferMgr, pacer pacer, df downloaderFactory) {
 	info := jptm.Info()
 	if info.IsFolderPropertiesTransfer() {
-		remoteToLocal_folder(jptm, p, pacer, df)
+		remoteToLocal_folder(jptm, pacer, df)
+	} else if info.EntityType == common.EEntityType.Symlink() {
+		remoteToLocal_symlink(jptm, pacer, df)
 	} else {
-		remoteToLocal_file(jptm, p, pacer, df)
+		remoteToLocal_file(jptm, pacer, df)
 	}
 }
 
 // general-purpose "any remote persistence location" to local, for files
-func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pacer, df downloaderFactory) {
+func remoteToLocal_file(jptm IJobPartTransferMgr, pacer pacer, df downloaderFactory) {
 
 	info := jptm.Info()
 
 	// step 1: create downloader instance for this transfer
 	// We are using a separate instance per transfer, in case some implementations need to hold per-transfer state
-	dl := df()
+	dl, err := df(jptm)
+	if err != nil {
+		jptm.SetStatus(common.ETransferStatus.Failed())
+		jptm.ReportTransferDone()
+		return
+	}
 
 	// step 2: get the source, destination info for the transfer.
 	fileSize := int64(info.SourceSize)
@@ -88,7 +95,7 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 
 			if !shouldOverwrite {
 				// logging as Warning so that it turns up even in compact logs, and because previously we use Error here
-				jptm.LogAtLevelForCurrentTransfer(pipeline.LogWarning, "File already exists, so will be skipped")
+				jptm.LogAtLevelForCurrentTransfer(common.LogWarning, "File already exists, so will be skipped")
 				jptm.SetStatus(common.ETransferStatus.SkippedEntityAlreadyExists())
 				jptm.ReportTransferDone()
 				return
@@ -110,31 +117,6 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 	// step 4a: mark destination as modified before we take our first action there (which is to create the destination file)
 	jptm.SetDestinationIsModified()
 
-	// step 4b: special handling for empty files
-	if fileSize == 0 {
-		if strings.EqualFold(info.Destination, common.Dev_Null) {
-			// do nothing
-		} else {
-			err := jptm.WaitUntilLockDestination(jptm.Context())
-			if err == nil {
-				err = createEmptyFile(jptm, info.Destination)
-			}
-			if err != nil {
-				jptm.LogDownloadError(info.Source, info.Destination, "Empty File Creation error "+err.Error(), 0)
-				jptm.SetStatus(common.ETransferStatus.Failed())
-			}
-		}
-		// Run the prologue anyway, as some downloaders (files) require this.
-		// Note that this doesn't actually have adverse effects (at the moment).
-		// For files, it just sets a few properties.
-		// For blobs, it sets up a page blob pacer if it's a page blob.
-		// For blobFS, it's a noop.
-		dl.Prologue(jptm, p)
-		epilogueWithCleanupDownload(jptm, dl, nil, nil) // need standard epilogue, rather than a quick exit, so we can preserve modification dates
-		return
-	}
-
-	// step 4c: normal file creation when source has content
 	writeThrough := false
 	// TODO: consider cases where we might set it to true. It might give more predictable and understandable disk throughput.
 	//    But can't be used in the cases shown in the if statement below (one of which is only pseudocode, at this stage)
@@ -145,24 +127,35 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 	//        writeThrough = false
 	//    }
 
-	failFileCreation := func(err error) {
-		jptm.LogDownloadError(info.Source, info.Destination, "File Creation Error "+err.Error(), 0)
-		jptm.SetStatus(common.ETransferStatus.Failed())
-		// use standard epilogue for consistency, but force release of file count (without an actual file) if necessary
-		epilogueWithCleanupDownload(jptm, dl, nil, nil)
-	}
-	// block until we can safely use a file handle
-	err := jptm.WaitUntilLockDestination(jptm.Context())
-	if err != nil {
-		failFileCreation(err)
-		return
-	}
-
 	var dstFile io.WriteCloser
-	if strings.EqualFold(info.Destination, common.Dev_Null) {
-		// the user wants to discard the downloaded data
-		dstFile = devNullWriter{}
-	} else {
+	if ctdl, ok := dl.(creationTimeDownloader); info.Destination != os.DevNull && ok { // ctdl never needs to handle devnull
+		failFileCreation := func(err error) {
+			jptm.LogDownloadError(info.Source, info.Destination, "File Creation Error "+err.Error(), 0)
+			jptm.SetStatus(common.ETransferStatus.Failed())
+			// use standard epilogue for consistency, but force release of file count (without an actual file) if necessary
+			epilogueWithCleanupDownload(jptm, dl, nil, nil)
+		}
+		// block until we can safely use a file handle
+		err := jptm.WaitUntilLockDestination(jptm.Context())
+		if err != nil {
+			failFileCreation(err)
+			return
+		}
+
+		size := fileSize
+		ct := common.ECompressionType.None()
+		if jptm.ShouldDecompress() {
+			size = 0                                  // we don't know what the final size will be, so we can't pre-size it
+			ct, err = jptm.GetSourceCompressionType() // calls same decompression getter routine as the front-end does
+			if err != nil {                           // check this, and return error, before we create any disk file, since if we return err, then no cleanup of file will be required
+				failFileCreation(err)
+				return
+			}
+			// Why get the decompression type again here, when we already looked at it at enumeration time?
+			// Because we have better ability to report unsupported compression types here, with clear "transfer failed" handling,
+			// and we still need to set size to zero here, so relying on enumeration more wouldn't simply this code much, if at all.
+		}
+
 		// Normal scenario, create the destination file as expected
 		// Use pseudo chunk id to allow our usual state tracking mechanism to keep count of how many
 		// file creations are running at any given instant, for perf diagnostics
@@ -171,11 +164,87 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 		// to correct name.
 		pseudoId := common.NewPseudoChunkIDForWholeFile(info.Source)
 		jptm.LogChunkStatus(pseudoId, common.EWaitReason.CreateLocalFile())
-		dstFile, err = createDestinationFile(jptm, info.getTempDownloadPath(), fileSize, writeThrough)
+		var needChunks bool
+		dstFile, needChunks, err = ctdl.CreateFile(jptm, info.getDownloadPath(), size, writeThrough, jptm.GetFolderCreationTracker())
 		jptm.LogChunkStatus(pseudoId, common.EWaitReason.ChunkDone()) // normal setting to done doesn't apply to these pseudo ids
 		if err != nil {
 			failFileCreation(err)
 			return
+		}
+
+		if !needChunks { // If no chunks need to be transferred (e.g. this is 0-bytes long, a symlink, etc.), treat it as a 0-byte transfer
+			dl.Prologue(jptm)
+			epilogueWithCleanupDownload(jptm, dl, nil, nil)
+			return
+		}
+
+		if jptm.ShouldDecompress() { // Wrap the file in the decompressor if necessary
+			jptm.LogAtLevelForCurrentTransfer(common.LogInfo, "will be decompressed from "+ct.String())
+
+			// wrap for automatic decompression
+			dstFile = common.NewDecompressingWriter(dstFile, ct)
+			// why don't we just let Go's network stack automatically decompress for us? Because
+			// 1. Then we can't check the MD5 hash (since logically, any stored hash should be the hash of the file that exists in Storage, i.e. the compressed one)
+			// 2. Then we can't pre-plan a certain number of fixed-size chunks (which is required by the way our architecture currently works).
+		}
+	} else {
+		// step 4b: special handling for empty files
+		if fileSize == 0 {
+			if strings.EqualFold(info.Destination, common.Dev_Null) {
+				// do nothing
+			} else {
+				err := jptm.WaitUntilLockDestination(jptm.Context())
+				if err == nil {
+					err = createEmptyFile(jptm, info.Destination)
+				}
+				if err != nil {
+					jptm.LogDownloadError(info.Source, info.Destination, "Empty File Creation error "+err.Error(), 0)
+					jptm.SetStatus(common.ETransferStatus.Failed())
+				}
+			}
+			// Run the prologue anyway, as some downloaders (files) require this.
+			// Note that this doesn't actually have adverse effects (at the moment).
+			// For files, it just sets a few properties.
+			// For blobs, it sets up a page blob pacer if it's a page blob.
+			// For blobFS, it's a noop.
+			dl.Prologue(jptm)
+			epilogueWithCleanupDownload(jptm, dl, nil, nil) // need standard epilogue, rather than a quick exit, so we can preserve modification dates
+			return
+		}
+
+		// step 4c: normal file creation when source has content
+
+		failFileCreation := func(err error) {
+			jptm.LogDownloadError(info.Source, info.Destination, "File Creation Error "+err.Error(), 0)
+			jptm.SetStatus(common.ETransferStatus.Failed())
+			// use standard epilogue for consistency, but force release of file count (without an actual file) if necessary
+			epilogueWithCleanupDownload(jptm, dl, nil, nil)
+		}
+		// block until we can safely use a file handle
+		err := jptm.WaitUntilLockDestination(jptm.Context())
+		if err != nil {
+			failFileCreation(err)
+			return
+		}
+
+		if strings.EqualFold(info.Destination, common.Dev_Null) {
+			// the user wants to discard the downloaded data
+			dstFile = devNullWriter{}
+		} else {
+			// Normal scenario, create the destination file as expected
+			// Use pseudo chunk id to allow our usual state tracking mechanism to keep count of how many
+			// file creations are running at any given instant, for perf diagnostics
+			//
+			// We create the file to a temporary location with name .azcopy-<jobID>-<actualName> and then move it
+			// to correct name.
+			pseudoId := common.NewPseudoChunkIDForWholeFile(info.Source)
+			jptm.LogChunkStatus(pseudoId, common.EWaitReason.CreateLocalFile())
+			dstFile, err = createDestinationFile(jptm, info.getDownloadPath(), fileSize, writeThrough)
+			jptm.LogChunkStatus(pseudoId, common.EWaitReason.ChunkDone()) // normal setting to done doesn't apply to these pseudo ids
+			if err != nil {
+				failFileCreation(err)
+				return
+			}
 		}
 	}
 
@@ -220,7 +289,7 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 
 	// step 5c: run prologue in downloader (here it can, for example, create things that will require cleanup in the epilogue)
 	common.GetLifecycleMgr().E2EAwaitAllowOpenFiles()
-	dl.Prologue(jptm, p)
+	dl.Prologue(jptm)
 
 	// step 5d: tell jptm what to expect, and how to clean up at the end
 	jptm.SetNumberOfChunks(numChunks)
@@ -253,7 +322,7 @@ func remoteToLocal_file(jptm IJobPartTransferMgr, p pipeline.Pipeline, pacer pac
 		_ = dstWriter.WaitToScheduleChunk(jptm.Context(), id, adjustedChunkSize)
 
 		// create download func that is a appropriate to the remote data source
-		downloadFunc := dl.GenerateDownloadFunc(jptm, p, dstWriter, id, adjustedChunkSize, pacer)
+		downloadFunc := dl.GenerateDownloadFunc(jptm, dstWriter, id, adjustedChunkSize, pacer)
 
 		// schedule the download chunk job
 		jptm.ScheduleChunks(downloadFunc)
@@ -288,7 +357,7 @@ func createDestinationFile(jptm IJobPartTransferMgr, destination string, size in
 		return nil, err
 	}
 	if jptm.ShouldDecompress() {
-		jptm.LogAtLevelForCurrentTransfer(pipeline.LogInfo, "will be decompressed from "+ct.String())
+		jptm.LogAtLevelForCurrentTransfer(common.LogInfo, "will be decompressed from "+ct.String())
 
 		// wrap for automatic decompression
 		dstFile = common.NewDecompressingWriter(dstFile, ct)
@@ -325,7 +394,7 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 		}
 		if closeErr != nil {
 			jptm.FailActiveDownload("Closing file", closeErr)
-			jptm.LogAtLevelForCurrentTransfer(pipeline.LogInfo, "Error closing file: "+closeErr.Error()) // log this way so that this line will be logged even if transfer is already failed
+			jptm.LogAtLevelForCurrentTransfer(common.LogInfo, "Error closing file: "+closeErr.Error()) // log this way so that this line will be logged even if transfer is already failed
 		}
 
 		// Check MD5 (but only if file was fully flushed and saved - else no point and may not have actualAsSaved hash anyway)
@@ -342,7 +411,7 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 
 			// check length if enabled (except for dev null and decompression case, where that's impossible)
 			if info.DestLengthValidation && info.Destination != common.Dev_Null && !jptm.ShouldDecompress() {
-				fi, err := common.OSStat(info.getTempDownloadPath())
+				fi, err := common.OSStat(info.getDownloadPath())
 
 				if err != nil {
 					jptm.FailActiveDownload("Download length check", err)
@@ -351,14 +420,14 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 				}
 			}
 
-			//Rename back to original name. At this point, we're sure the file is completely
-			//downloaded and not corrupt. Infact, post this point we should only log errors and
-			//not fail the transfer.
-			if err == nil && !strings.EqualFold(info.Destination, common.Dev_Null) {
-				renameErr := os.Rename(info.getTempDownloadPath(), info.Destination)
+			// check if we need to rename back to original name. At this point, we're sure the file is completely
+			// downloaded and not corrupt.
+			renameNecessary := !strings.EqualFold(info.getDownloadPath(), info.Destination) &&
+				!strings.EqualFold(info.Destination, common.Dev_Null)
+			if err == nil && renameNecessary {
+				renameErr := os.Rename(info.getDownloadPath(), info.Destination)
 				if renameErr != nil {
-					jptm.LogError(info.Destination, fmt.Sprintf(
-						"Failed to rename. File at %s", info.getTempDownloadPath()), renameErr)
+					jptm.FailActiveDownload("Download rename", renameErr)
 				}
 			}
 		}
@@ -382,7 +451,7 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 				jptm.LogError(info.Destination, "Changing Modified Time ", err)
 				// do NOT return, since final status and cleanup logging still to come
 			} else {
-				jptm.Log(pipeline.LogInfo, fmt.Sprintf(" Preserved Modified Time for %s", info.Destination))
+				jptm.Log(common.LogInfo, fmt.Sprintf(" Preserved Modified Time for %s", info.Destination))
 			}
 		}
 	}
@@ -390,7 +459,8 @@ func epilogueWithCleanupDownload(jptm IJobPartTransferMgr, dl downloader, active
 	commonDownloaderCompletion(jptm, info, common.EEntityType.File())
 }
 
-func commonDownloaderCompletion(jptm IJobPartTransferMgr, info TransferInfo, entityType common.EntityType) {
+func commonDownloaderCompletion(jptm IJobPartTransferMgr, info *TransferInfo, entityType common.EntityType) {
+redoCompletion:
 	// note that we do not really know whether the context was canceled because of an error, or because the user asked for it
 	// if was an intentional cancel, the status is still "in progress", so we are still counting it as pending
 	// we leave these transfer status alone
@@ -399,12 +469,12 @@ func commonDownloaderCompletion(jptm IJobPartTransferMgr, info TransferInfo, ent
 		// If failed, log and delete the "bad" local file
 		// If the current transfer status value is less than or equal to 0
 		// then transfer either failed or was cancelled
-		if jptm.ShouldLog(pipeline.LogDebug) {
-			jptm.Log(pipeline.LogDebug, " Finalizing Transfer Cancellation/Failure")
+		if jptm.ShouldLog(common.LogDebug) {
+			jptm.Log(common.LogDebug, " Finalizing Transfer Cancellation/Failure")
 		}
 		// for files only, cleanup local file if applicable
 		if entityType == entityType.File() && jptm.IsDeadInflight() && jptm.HoldsDestinationLock() {
-			jptm.LogAtLevelForCurrentTransfer(pipeline.LogInfo, "Deleting incomplete destination file")
+			jptm.LogAtLevelForCurrentTransfer(common.LogInfo, "Deleting incomplete destination file")
 
 			// the file created locally should be deleted
 			tryDeleteFile(info, jptm)
@@ -414,17 +484,44 @@ func commonDownloaderCompletion(jptm IJobPartTransferMgr, info TransferInfo, ent
 			panic("reached branch where jptm is assumed to be live, but it isn't")
 		}
 
+		// Attempt to put MD5 data if necessary, compliant with the sync hash scheme
+		if jptm.ShouldPutMd5() {
+			fi, err := os.Stat(info.Destination)
+			if err != nil {
+				jptm.FailActiveDownload("saving MD5 data (stat to pull LMT)", err)
+				goto redoCompletion // let fail as expected
+			}
+
+			plan := jptm.(*jobPartTransferMgr).jobPartMgr.Plan()
+			dataRoot := string(plan.DestinationRoot[:plan.DestinationRootLength])
+			_, idx := jptm.TransferIndex()
+			_, relDest := plan.TransferSrcDstRelatives(idx)
+			adapter, err := common.NewHashDataAdapter(common.LocalHashDir, dataRoot, common.LocalHashStorageMode)
+			if err != nil {
+				jptm.FailActiveDownload("initializing hash adapter", err)
+			}
+			err = adapter.SetHashData(relDest, &common.SyncHashData{
+				Mode: common.ESyncHashType.MD5(),
+				LMT:  fi.ModTime(),
+				Data: base64.StdEncoding.EncodeToString(info.SrcHTTPHeaders.ContentMD5),
+			})
+			if err != nil {
+				jptm.FailActiveDownload("saving MD5 data (writing alternate data stream)", err)
+				goto redoCompletion // let fail as expected
+			}
+		}
+
 		// We know all chunks are done (because this routine was called)
 		// and we know the transfer didn't fail (because just checked its status above),
 		// so it must have succeeded. So make sure its not left "in progress" state
 		jptm.SetStatus(common.ETransferStatus.Success())
 
 		// Final logging
-		if jptm.ShouldLog(pipeline.LogInfo) { // TODO: question: can we remove these ShouldLogs?  Aren't they inside Log?
-			jptm.Log(pipeline.LogInfo, fmt.Sprintf("DOWNLOADSUCCESSFUL: %s%s", info.entityTypeLogIndicator(), info.Destination))
+		if jptm.ShouldLog(common.LogInfo) { // TODO: question: can we remove these ShouldLogs?  Aren't they inside Log?
+			jptm.Log(common.LogInfo, fmt.Sprintf("DOWNLOADSUCCESSFUL: %s%s", info.entityTypeLogIndicator(), info.Destination))
 		}
-		if jptm.ShouldLog(pipeline.LogDebug) {
-			jptm.Log(pipeline.LogDebug, "Finalizing Transfer")
+		if jptm.ShouldLog(common.LogDebug) {
+			jptm.Log(common.LogDebug, "Finalizing Transfer")
 		}
 	}
 
@@ -455,25 +552,29 @@ func deleteFile(destinationPath string) error {
 }
 
 // tries to delete file, but if that fails just logs and returns
-func tryDeleteFile(info TransferInfo, jptm IJobPartTransferMgr) {
+func tryDeleteFile(info *TransferInfo, jptm IJobPartTransferMgr) {
 	// skip deleting if we are targeting dev null and throwing away the data
 	if strings.EqualFold(common.Dev_Null, info.Destination) {
 		return
 	}
 
-	err := deleteFile(info.getTempDownloadPath())
+	err := deleteFile(info.getDownloadPath())
 	if err != nil {
 		// If there was an error deleting the file, log the error
 		jptm.LogError(info.Destination, "Delete File Error ", err)
 	}
 }
 
-//Returns the path of temp file to be downloaded. The paths is in format
+// Returns the path of file to be downloaded. If we want to
+// download to a temp path we return a temp path in format
 // /actual/parent/path/.azDownload-<jobID>-<actualFileName>
-func (info *TransferInfo) getTempDownloadPath() string {
-	parent, fileName := filepath.Split(info.Destination)
-	fileName = fmt.Sprintf(azcopyTempDownloadPrefix, info.JobID.String()) + fileName
-	return filepath.Join(parent, fileName)
+func (info *TransferInfo) getDownloadPath() string {
+	if common.GetLifecycleMgr().DownloadToTempPath() && info.SourceSize > 0 { // 0-byte files don't need a rename.
+		parent, fileName := filepath.Split(info.Destination)
+		fileName = fmt.Sprintf(azcopyTempDownloadPrefix, info.JobID.String()) + fileName
+		return filepath.Join(parent, fileName)
+	}
+	return info.Destination
 }
 
 // conforms to io.Writer and io.Closer

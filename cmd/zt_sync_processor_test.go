@@ -22,24 +22,21 @@ package cmd
 
 import (
 	"context"
+	"github.com/stretchr/testify/assert"
 	"os"
 	"path/filepath"
+	"testing"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
-	chk "gopkg.in/check.v1"
 )
 
-type syncProcessorSuite struct{}
-
-var _ = chk.Suite(&syncProcessorSuite{})
-
-func (s *syncProcessorSuite) TestLocalDeleter(c *chk.C) {
+func TestLocalDeleter(t *testing.T) {
+	a := assert.New(t)
 	// set up the local file
-	dstDirName := scenarioHelper{}.generateLocalDirectory(c)
+	dstDirName := scenarioHelper{}.generateLocalDirectory(a)
 	defer os.RemoveAll(dstDirName)
 	dstFileName := "extraFile.txt"
-	scenarioHelper{}.generateLocalFilesFromList(c, dstDirName, []string{dstFileName})
+	scenarioHelper{}.generateLocalFilesFromList(a, dstDirName, []string{dstFileName})
 
 	// construct the cooked input to simulate user input
 	cca := &cookedSyncCmdArgs{
@@ -48,73 +45,76 @@ func (s *syncProcessorSuite) TestLocalDeleter(c *chk.C) {
 	}
 
 	// set up local deleter
-	deleter := newSyncLocalDeleteProcessor(cca)
+	deleter := newSyncLocalDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders())
 
 	// validate that the file still exists
 	_, err := os.Stat(filepath.Join(dstDirName, dstFileName))
-	c.Assert(err, chk.IsNil)
+	a.Nil(err)
 
 	// exercise the deleter
 	err = deleter.removeImmediately(StoredObject{relativePath: dstFileName})
-	c.Assert(err, chk.IsNil)
+	a.Nil(err)
 
 	// validate that the file no longer exists
 	_, err = os.Stat(filepath.Join(dstDirName, dstFileName))
-	c.Assert(err, chk.NotNil)
+	a.NotNil(err)
 }
 
-func (s *syncProcessorSuite) TestBlobDeleter(c *chk.C) {
-	bsu := getBSU()
+func TestBlobDeleter(t *testing.T) {
+	a := assert.New(t)
+	bsc := getBlobServiceClient()
 	blobName := "extraBlob.pdf"
 
 	// set up the blob to delete
-	containerURL, containerName := createNewContainer(c, bsu)
-	defer deleteContainer(c, containerURL)
-	scenarioHelper{}.generateBlobsFromList(c, containerURL, []string{blobName}, blockBlobDefaultData)
+	cc, containerName := createNewContainer(a, bsc)
+	defer deleteContainer(a, cc)
+	scenarioHelper{}.generateBlobsFromList(a, cc, []string{blobName}, blockBlobDefaultData)
 
 	// validate that the blob exists
-	blobURL := containerURL.NewBlobURL(blobName)
-	_, err := blobURL.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
-	c.Assert(err, chk.IsNil)
+	bc := cc.NewBlobClient(blobName)
+	_, err := bc.GetProperties(context.Background(), nil)
+	a.Nil(err)
 
 	// construct the cooked input to simulate user input
-	rawContainerURL := scenarioHelper{}.getRawContainerURLWithSAS(c, containerName)
+	rawContainerURL := scenarioHelper{}.getRawContainerURLWithSAS(a, containerName)
 	cca := &cookedSyncCmdArgs{
 		destination:       newRemoteRes(rawContainerURL.String()),
 		credentialInfo:    common.CredentialInfo{CredentialType: common.ECredentialType.Anonymous()},
 		deleteDestination: common.EDeleteDestination.True(),
 		fromTo:            common.EFromTo.LocalBlob(),
 	}
+	sc := common.NewServiceClient(bsc, nil, nil)
 
 	// set up the blob deleter
-	deleter, err := newSyncDeleteProcessor(cca)
-	c.Assert(err, chk.IsNil)
+	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders(), sc)
+	a.Nil(err)
 
 	// exercise the deleter
 	err = deleter.removeImmediately(StoredObject{relativePath: blobName})
-	c.Assert(err, chk.IsNil)
+	a.Nil(err)
 
 	// validate that the blob was deleted
-	_, err = blobURL.GetProperties(context.Background(), azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
-	c.Assert(err, chk.NotNil)
+	_, err = bc.GetProperties(context.Background(),nil)
+	a.NotNil(err)
 }
 
-func (s *syncProcessorSuite) TestFileDeleter(c *chk.C) {
-	fsu := getFSU()
+func TestFileDeleter(t *testing.T) {
+	a := assert.New(t)
+	fsc := getFileServiceClient()
 	fileName := "extraFile.pdf"
 
 	// set up the file to delete
-	shareURL, shareName := createNewAzureShare(c, fsu)
-	defer deleteShare(c, shareURL)
-	scenarioHelper{}.generateAzureFilesFromList(c, shareURL, []string{fileName})
+	shareClient, shareName := createNewShare(a, fsc)
+	defer deleteShare(a, shareClient)
+	scenarioHelper{}.generateShareFilesFromList(a, shareClient, fsc, []string{fileName})
 
 	// validate that the file exists
-	fileURL := shareURL.NewRootDirectoryURL().NewFileURL(fileName)
-	_, err := fileURL.GetProperties(context.Background())
-	c.Assert(err, chk.IsNil)
+	fileClient := shareClient.NewRootDirectoryClient().NewFileClient(fileName)
+	_, err := fileClient.GetProperties(context.Background(), nil)
+	a.Nil(err)
 
 	// construct the cooked input to simulate user input
-	rawShareSAS := scenarioHelper{}.getRawShareURLWithSAS(c, shareName)
+	rawShareSAS := scenarioHelper{}.getRawShareURLWithSAS(a, shareName)
 	cca := &cookedSyncCmdArgs{
 		destination:       newRemoteRes(rawShareSAS.String()),
 		credentialInfo:    common.CredentialInfo{CredentialType: common.ECredentialType.Anonymous()},
@@ -122,15 +122,16 @@ func (s *syncProcessorSuite) TestFileDeleter(c *chk.C) {
 		fromTo:            common.EFromTo.FileFile(),
 	}
 
+	sc := common.NewServiceClient(nil, fsc, nil)
 	// set up the file deleter
-	deleter, err := newSyncDeleteProcessor(cca)
-	c.Assert(err, chk.IsNil)
+	deleter, err := newSyncDeleteProcessor(cca, common.EFolderPropertiesOption.NoFolders(), sc)
+	a.Nil(err)
 
 	// exercise the deleter
 	err = deleter.removeImmediately(StoredObject{relativePath: fileName})
-	c.Assert(err, chk.IsNil)
+	a.Nil(err)
 
 	// validate that the file was deleted
-	_, err = fileURL.GetProperties(context.Background())
-	c.Assert(err, chk.NotNil)
+	_, err = fileClient.GetProperties(context.Background(), nil)
+	a.NotNil(err)
 }

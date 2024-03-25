@@ -22,9 +22,9 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	pipeline2 "github.com/Azure/azure-pipeline-go/pipeline"
 	"strconv"
 	"strings"
 
@@ -42,6 +42,7 @@ type rawListCmdArgs struct {
 	MachineReadable bool
 	RunningTally    bool
 	MegaUnits       bool
+	trailingDot     string
 }
 
 type validProperty string
@@ -53,15 +54,17 @@ const (
 	blobAccessTier   validProperty = "BlobAccessTier"
 	contentType      validProperty = "ContentType"
 	contentEncoding  validProperty = "ContentEncoding"
+	contentMD5       validProperty = "ContentMD5"
 	leaseState       validProperty = "LeaseState"
 	leaseDuration    validProperty = "LeaseDuration"
 	leaseStatus      validProperty = "LeaseStatus"
+	archiveStatus    validProperty = "ArchiveStatus"
 )
 
 // validProperties returns an array of possible values for the validProperty const type.
 func validProperties() []validProperty {
 	return []validProperty{lastModifiedTime, versionId, blobType, blobAccessTier,
-		contentType, contentEncoding, leaseState, leaseDuration, leaseStatus}
+		contentType, contentEncoding, contentMD5, leaseState, leaseDuration, leaseStatus, archiveStatus}
 }
 
 func (raw *rawListCmdArgs) parseProperties(rawProperties string) []validProperty {
@@ -93,6 +96,10 @@ func (raw rawListCmdArgs) cook() (cookedListCmdArgs, error) {
 	cooked.RunningTally = raw.RunningTally
 	cooked.MegaUnits = raw.MegaUnits
 	cooked.location = location
+	err := cooked.trailingDot.Parse(raw.trailingDot)
+	if err != nil {
+		return cooked, err
+	}
 
 	if raw.Properties != "" {
 		cooked.properties = raw.parseProperties(raw.Properties)
@@ -109,6 +116,7 @@ type cookedListCmdArgs struct {
 	MachineReadable bool
 	RunningTally    bool
 	MegaUnits       bool
+	trailingDot     common.TrailingDotOption
 }
 
 var raw rawListCmdArgs
@@ -154,6 +162,9 @@ func init() {
 	listContainerCmd.PersistentFlags().BoolVar(&raw.RunningTally, "running-tally", false, "Counts the total number of files and their sizes.")
 	listContainerCmd.PersistentFlags().BoolVar(&raw.MegaUnits, "mega-units", false, "Displays units in orders of 1000, not 1024.")
 	listContainerCmd.PersistentFlags().StringVar(&raw.Properties, "properties", "", "delimiter (;) separated values of properties required in list output.")
+	listContainerCmd.PersistentFlags().StringVar(&raw.trailingDot, "trailing-dot", "", "'Enable' by default to treat file share related operations in a safe manner. Available options: Enable, Disable. "+
+		"Choose 'Disable' to go back to legacy (potentially unsafe) treatment of trailing dot files where the file service will trim any trailing dots in paths. This can result in potential data corruption if the transfer contains two paths that differ only by a trailing dot (ex: mypath and mypath.). If this flag is set to 'Disable' and AzCopy encounters a trailing dot file, it will warn customers in the scanning log but will not attempt to abort the operation."+
+		"If the destination does not support trailing dot files (Windows or Blob Storage), AzCopy will fail if the trailing dot file is the root of the transfer and skip any trailing dot paths encountered during enumeration.")
 
 	rootCmd.AddCommand(listContainerCmd)
 }
@@ -175,12 +186,16 @@ func (cooked cookedListCmdArgs) processProperties(object StoredObject) string {
 			builder.WriteString(propertyStr + ": " + object.contentType + "; ")
 		case contentEncoding:
 			builder.WriteString(propertyStr + ": " + object.contentEncoding + "; ")
+		case contentMD5:
+			builder.WriteString(propertyStr + ": " + base64.StdEncoding.EncodeToString(object.md5) + "; ")
 		case leaseState:
 			builder.WriteString(propertyStr + ": " + string(object.leaseState) + "; ")
 		case leaseStatus:
 			builder.WriteString(propertyStr + ": " + string(object.leaseStatus) + "; ")
 		case leaseDuration:
 			builder.WriteString(propertyStr + ": " + string(object.leaseDuration) + "; ")
+		case archiveStatus:
+			builder.WriteString(propertyStr + ": " + string(object.archiveStatus) + "; ")
 		}
 	}
 	return builder.String()
@@ -198,6 +213,10 @@ func (cooked cookedListCmdArgs) HandleListContainerCommand() (err error) {
 		return err
 	}
 
+	if err := common.VerifyIsURLResolvable(raw.sourcePath); cooked.location.IsRemote() && err != nil {
+		return fmt.Errorf("failed to resolve target: %w", err)
+	}
+
 	level, err := DetermineLocationLevel(source.Value, cooked.location, true)
 
 	if err != nil {
@@ -209,7 +228,7 @@ func (cooked cookedListCmdArgs) HandleListContainerCommand() (err error) {
 		return fmt.Errorf("failed to obtain credential info: %s", err.Error())
 	} else if cooked.location == cooked.location.File() && source.SAS == "" {
 		return errors.New("azure files requires a SAS token for authentication")
-	} else if credentialInfo.CredentialType == common.ECredentialType.OAuthToken() {
+	} else if credentialInfo.CredentialType.IsAzureOAuth() {
 		uotm := GetUserOAuthTokenManagerInstance()
 		if tokenInfo, err := uotm.GetTokenInfo(ctx); err != nil {
 			return err
@@ -218,9 +237,7 @@ func (cooked cookedListCmdArgs) HandleListContainerCommand() (err error) {
 		}
 	}
 
-	traverser, err := InitResourceTraverser(source, cooked.location, &ctx, &credentialInfo, nil, nil,
-		true, false, false, common.EPermanentDeleteOption.None(), func(common.EntityType) {},
-		nil, false, pipeline2.LogNone, common.CpkOptions{})
+	traverser, err := InitResourceTraverser(source, cooked.location, &ctx, &credentialInfo, common.ESymlinkHandlingType.Skip(), nil, true, true, false, common.EPermanentDeleteOption.None(), func(common.EntityType) {}, nil, false, common.ESyncHashType.None(), common.EPreservePermissionsOption.None(), common.LogNone, common.CpkOptions{}, nil, false, cooked.trailingDot, nil, nil)
 
 	if err != nil {
 		return fmt.Errorf("failed to initialize traverser: %s", err.Error())

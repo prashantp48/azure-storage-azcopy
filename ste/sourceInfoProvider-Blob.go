@@ -21,18 +21,77 @@
 package ste
 
 import (
-	"strings"
-	"time"
-
-	"github.com/Azure/azure-storage-azcopy/v10/azbfs"
+	"crypto/md5"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"io"
+	"time"
 )
 
 // Source info provider for Azure blob
 type blobSourceInfoProvider struct {
 	defaultRemoteSourceInfoProvider
+	source *blob.Client
+}
+
+func (p *blobSourceInfoProvider) IsDFSSource() bool {
+	return p.jptm.FromTo().From() == common.ELocation.BlobFS()
+}
+
+func (p *blobSourceInfoProvider) PreSignedSourceURL() (string, error) {
+	return p.source.URL(), nil // prefer to return the blob URL; data can be read from either endpoint.
+}
+
+func (p *blobSourceInfoProvider) RawSource() string {
+	return p.source.URL()
+}
+
+func (p *blobSourceInfoProvider) ReadLink() (string, error) {
+	ctx := p.jptm.Context()
+
+	resp, err := p.source.DownloadStream(ctx, &blob.DownloadStreamOptions{
+		CPKInfo:      p.jptm.CpkInfo(),
+		CPKScopeInfo: p.jptm.CpkScopeInfo(),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	symlinkBuf, err := io.ReadAll(resp.NewRetryReader(ctx, &blob.RetryReaderOptions{
+		MaxRetries:   5,
+		OnFailedRead: common.NewBlobReadLogFunc(p.jptm, p.jptm.Info().Source),
+	}))
+	if err != nil {
+		return "", err
+	}
+
+	return string(symlinkBuf), nil
+}
+
+func (p *blobSourceInfoProvider) GetUNIXProperties() (common.UnixStatAdapter, error) {
+	prop, err := p.Properties()
+	if err != nil {
+		return nil, err
+	}
+
+	return common.ReadStatFromMetadata(prop.SrcMetadata, p.SourceSize())
+}
+
+func (p *blobSourceInfoProvider) HasUNIXProperties() bool {
+	prop, err := p.Properties()
+	if err != nil {
+		return false // This transfer is probably going to fail anyway.
+	}
+
+	for _, v := range common.AllLinuxProperties {
+		_, ok := prop.SrcMetadata[v]
+		if ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func newBlobSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, error) {
@@ -41,50 +100,94 @@ func newBlobSourceInfoProvider(jptm IJobPartTransferMgr) (ISourceInfoProvider, e
 		return nil, err
 	}
 
-	return &blobSourceInfoProvider{defaultRemoteSourceInfoProvider: *base}, nil
-}
-
-// AccessControl should ONLY get called when we know for a fact it is a blobFS->blobFS tranfser.
-// It *assumes* that the source is actually a HNS account.
-func (p *blobSourceInfoProvider) AccessControl() (azbfs.BlobFSAccessControl, error) {
-	presignedURL, err := p.PreSignedSourceURL()
-	if err != nil {
-		return azbfs.BlobFSAccessControl{}, err
+	var ret = &blobSourceInfoProvider{
+		defaultRemoteSourceInfoProvider: *base,
 	}
 
-	bURLParts := azblob.NewBlobURLParts(*presignedURL)
-	bURLParts.Host = strings.ReplaceAll(bURLParts.Host, ".blob", ".dfs")
-	bURLParts.BlobName = strings.TrimSuffix(bURLParts.BlobName, "/") // BlobFS doesn't handle folders correctly like this.
-	// todo: jank, and violates the principle of interfaces
-	fURL := azbfs.NewFileURL(bURLParts.URL(), p.jptm.(*jobPartTransferMgr).jobPartMgr.(*jobPartMgr).secondarySourceProviderPipeline)
+	bsc, err := jptm.SrcServiceClient().BlobServiceClient()
+	if err != nil {
+		return nil, err
+	}
 
-	return fURL.GetAccessControl(p.jptm.Context())
+	blobClient := bsc.NewContainerClient(jptm.Info().SrcContainer).NewBlobClient(jptm.Info().SrcFilePath)
+
+	if jptm.Info().VersionID != "" {
+		blobClient, err = blobClient.WithVersionID(jptm.Info().VersionID)
+		if err != nil {
+			return nil, err
+		}
+	} else if jptm.Info().SnapshotID != "" {
+		blobClient, err = blobClient.WithSnapshot(jptm.Info().SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ret.source = blobClient
+
+	return ret, nil
 }
 
-func (p *blobSourceInfoProvider) BlobTier() azblob.AccessTierType {
-	return p.transferInfo.S2SSrcBlobTier
-} 
+func (p *blobSourceInfoProvider) AccessControl() (*string, error) {
+	dsc, err := p.jptm.SrcServiceClient().DatalakeServiceClient()
+	if err != nil {
+		return nil, err
+	}
 
-func (p *blobSourceInfoProvider) BlobType() azblob.BlobType {
+	sourceDatalakeClient := dsc.NewFileSystemClient(p.jptm.Info().SrcContainer).NewFileClient(p.jptm.Info().SrcFilePath)
+
+	resp, err := sourceDatalakeClient.GetAccessControl(p.jptm.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return resp.ACL, nil
+}
+
+func (p *blobSourceInfoProvider) BlobTier() *blob.AccessTier {
+	if p.transferInfo.S2SSrcBlobTier == "" {
+		return nil
+	}
+	return to.Ptr(p.transferInfo.S2SSrcBlobTier)
+}
+
+func (p *blobSourceInfoProvider) BlobType() blob.BlobType {
 	return p.transferInfo.SrcBlobType
 }
 
 func (p *blobSourceInfoProvider) GetFreshFileLastModifiedTime() (time.Time, error) {
-	presignedURL, err := p.PreSignedSourceURL()
+	// We can't set a custom LMT on HNS, so it doesn't make sense to swap here.
+	properties, err := p.source.GetProperties(p.jptm.Context(), &blob.GetPropertiesOptions{CPKInfo: p.jptm.CpkInfo()})
 	if err != nil {
 		return time.Time{}, err
 	}
+	return common.IffNotNil(properties.LastModified, time.Time{}), nil
+}
 
-	blobURL := azblob.NewBlobURL(*presignedURL, p.jptm.SourceProviderPipeline())
-	clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-	if p.jptm.IsSourceEncrypted() {
-		clientProvidedKey = common.ToClientProvidedKeyOptions(p.jptm.CpkInfo(), p.jptm.CpkScopeInfo())
+func (p *blobSourceInfoProvider) GetMD5(offset, count int64) ([]byte, error) {
+	var rangeGetContentMD5 *bool
+	if count <= common.MaxRangeGetSize {
+		rangeGetContentMD5 = to.Ptr(true)
 	}
-
-	properties, err := blobURL.GetProperties(p.jptm.Context(), azblob.BlobAccessConditions{}, clientProvidedKey)
+	response, err := p.source.DownloadStream(p.jptm.Context(),
+		&blob.DownloadStreamOptions{
+			Range:              blob.HTTPRange{Offset: offset, Count: count},
+			RangeGetContentMD5: rangeGetContentMD5,
+			CPKInfo:            p.jptm.CpkInfo(),
+			CPKScopeInfo:       p.jptm.CpkScopeInfo(),
+		})
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
-
-	return properties.LastModified(), nil
+	if response.ContentMD5 != nil && len(response.ContentMD5) > 0 {
+		return response.ContentMD5, nil
+	} else {
+		// compute md5
+		body := response.NewRetryReader(p.jptm.Context(), &blob.RetryReaderOptions{MaxRetries: MaxRetryPerDownloadBody})
+		defer body.Close()
+		h := md5.New()
+		if _, err = io.Copy(h, body); err != nil {
+			return nil, err
+		}
+		return h.Sum(nil), nil
+	}
 }

@@ -12,7 +12,7 @@ import os.path
 class Service_2_Service_Copy_User_Scenario(unittest.TestCase):
 
     def setUp(self):
-        cmd = util.Command("login").add_arguments("--service-principal").add_flags("application-id", os.environ['ACTIVE_DIRECTORY_APPLICATION_ID'])
+        cmd = util.Command("login").add_arguments("--service-principal").add_flags("application-id", os.environ['ACTIVE_DIRECTORY_APPLICATION_ID']).add_flags("tenant-id", os.environ['OAUTH_TENANT_ID'])
         cmd.execute_azcopy_copy_command()
         # init bucket_name
         common_prefix = 's2scopybucket'
@@ -304,7 +304,7 @@ class Service_2_Service_Copy_User_Scenario(unittest.TestCase):
 
     # Test oauth support for service to service copy, where source is authenticated with SAS
     # and destination is authenticated with OAuth token.
-    @unittest.skip("coverd by blob to blob")
+    @unittest.skip("covered by blob to blob")
     def test_copy_single_17mb_file_from_file_to_blob_oauth(self):
         src_share_url = util.get_object_sas(util.test_s2s_src_file_account_url, self.bucket_name_file_blob)
         dst_container_url = util.get_object_without_sas(util.test_s2s_dst_blob_account_url, self.bucket_name_file_blob)
@@ -554,7 +554,7 @@ class Service_2_Service_Copy_User_Scenario(unittest.TestCase):
 
     # Test oauth support for service to service copy, where source is authenticated with access key for S3
     # and destination is authenticated with OAuth token.
-    @unittest.skip("coverd by blob to blob")
+    @unittest.skip("covered by blob to blob")
     def test_copy_single_17mb_file_from_s3_to_blob_oauth(self):
         src_bucket_url = util.get_object_without_sas(util.test_s2s_src_s3_service_url, self.bucket_name_s3_blob)
         dst_container_url = util.get_object_without_sas(util.test_s2s_dst_blob_account_url, self.bucket_name_s3_blob)

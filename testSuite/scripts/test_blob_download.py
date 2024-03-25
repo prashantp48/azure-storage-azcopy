@@ -10,7 +10,7 @@ import unittest
 
 class Blob_Download_User_Scenario(unittest.TestCase):
     def setUp(self):
-        cmd = util.Command("login").add_arguments("--service-principal").add_flags("application-id", os.environ['ACTIVE_DIRECTORY_APPLICATION_ID'])
+        cmd = util.Command("login").add_arguments("--service-principal").add_flags("application-id", os.environ['ACTIVE_DIRECTORY_APPLICATION_ID']).add_flags("tenant-id", os.environ['OAUTH_TENANT_ID'])
         cmd.execute_azcopy_copy_command()
 
     def tearDown(self):
@@ -39,6 +39,29 @@ class Blob_Download_User_Scenario(unittest.TestCase):
         # note we have no tests to verify the success of check-md5. TODO: remove this when fault induction is introduced
         src = util.get_resource_sas(filename)
         dst = os.devnull
+        result = util.Command("copy").add_arguments(src).add_arguments(dst).add_flags("log-level", "info")
+
+    def test_download_1kb_blob_to_root(self):
+        # create file of size 1kb
+        filename = "test_1kb_blob_upload_download_null.txt"
+        file_path = util.create_test_file(filename, 1024)
+
+        # upload 1kb using azcopy
+        src = file_path
+        dst = util.test_container_url
+        result = util.Command("copy").add_arguments(src).add_arguments(dst). \
+            add_flags("log-level", "info").execute_azcopy_copy_command()
+        self.assertTrue(result)
+
+        # verify the uploaded blob
+        resource_url = util.get_resource_sas(filename)
+        result = util.Command("testBlob").add_arguments(file_path).add_arguments(resource_url).execute_azcopy_verify()
+        self.assertTrue(result)
+
+        # downloading the uploaded blob to devnull
+        # note we have no tests to verify the success of check-md5. TODO: remove this when fault induction is introduced
+        src = util.get_resource_sas(filename)
+        dst = "/"
         result = util.Command("copy").add_arguments(src).add_arguments(dst).add_flags("log-level", "info")
 
     # test_download_1kb_blob verifies the download of 1Kb blob using azcopy.
@@ -119,7 +142,7 @@ class Blob_Download_User_Scenario(unittest.TestCase):
         result = util.Command("testBlob").add_arguments(file_path).add_arguments(destination_sas).execute_azcopy_verify()
         self.assertTrue(result)
 
-        # downloading the created parallely in blocks of 4mb file through azcopy.
+        # downloading the created parallelly in blocks of 4mb file through azcopy.
         download_file = util.test_directory_path + "/test_63mb_in4mb_download.txt"
         result = util.Command("copy").add_arguments(destination_sas).add_arguments(download_file)\
                     .add_flags("log-level","info").add_flags("block-size-mb", "4").execute_azcopy_copy_command()

@@ -24,11 +24,14 @@ Copies source data to a destination location. The supported directions are:
   - local <-> Azure Files (Share/directory SAS authentication)
   - local <-> ADLS Gen 2 (SAS, OAuth, or SharedKey authentication)
   - Azure Blob (SAS or public) -> Azure Blob (SAS or OAuth authentication)
+  - ADLS Gen 2 (SAS or public) -> ADLS Gen 2 (SAS or OAuth authentication)
+  - ADLS Gen2 (SAS or OAuth authentication) <-> ADLS Gen2 (SAS or OAuth authentication)
+  - ADLS Gen2 (SAS or OAuth authentication) <-> Azure Blob (SAS or OAuth authentication)
   - Azure Blob (SAS or public) -> Azure Files (SAS)
   - Azure Files (SAS) -> Azure Files (SAS)
   - Azure Files (SAS) -> Azure Blob (SAS or OAuth authentication)
   - AWS S3 (Access Key) -> Azure Block Blob (SAS or OAuth authentication)
-  - Google Cloud Storage (Service Account Key) -> Azure Block Blob (SAS or OAuth authentication) [Preview]
+  - Google Cloud Storage (Service Account Key) -> Azure Block Blob (SAS or OAuth authentication)
 
 Please refer to the examples for more information.
 
@@ -130,11 +133,15 @@ Download all the versions of a blob from Azure Storage to local directory. Ensur
 
   - azcopy cp "https://[srcaccount].blob.core.windows.net/[containername]/[blobname]" "/path/to/dir" --list-of-versions="/another/path/to/dir/[versionidsFile]"
 
+Copy a subset of files within a flat container by using a wildcard symbol (*) in the container name without listing all files in the container.
+
+  - azcopy cp "https://[srcaccount].blob.core.windows.net/[containername]/*" "/path/to/dir" --include-pattern="1*"
+
 Copy a single blob to another blob by using a SAS token.
 
   - azcopy cp "https://[srcaccount].blob.core.windows.net/[container]/[path/to/blob]?[SAS]" "https://[destaccount].blob.core.windows.net/[container]/[path/to/blob]?[SAS]"
 
-Copy a single blob to another blob by using a SAS token and an OAuth token. You have to use a SAS token at the end of the source account URL, but the destination account doesn't need one if you log into AzCopy by using the azcopy login command. 
+Copy a single blob to another blob by using a SAS token and an OAuth token. You have to use a SAS token at the end of the source account URL if you do not have the right permissions to read it with the identity used for login. 
 
   - azcopy cp "https://[srcaccount].blob.core.windows.net/[container]/[path/to/blob]?[SAS]" "https://[destaccount].blob.core.windows.net/[container]/[path/to/blob]"
 
@@ -254,7 +261,7 @@ const listCmdShortDescription = "List the entities in a given resource"
 const listCmdLongDescription = `List the entities in a given resource. Blob, Files, and ADLS Gen 2 containers, folders, and accounts are supported.`
 
 const listCmdExample = "azcopy list [containerURL] --properties [semicolon(;) separated list of attributes " +
-	"(LastModifiedTime, VersionId, BlobType, BlobAccessTier, ContentType, ContentEncoding, LeaseState, LeaseDuration, LeaseStatus) " +
+	"(LastModifiedTime, VersionId, BlobType, BlobAccessTier, ContentType, ContentEncoding, ContentMD5, LeaseState, LeaseDuration, LeaseStatus) " +
 	"enclosed in double quotes (\")]"
 
 // ===================================== LOGIN COMMAND ===================================== //
@@ -379,10 +386,11 @@ Remove a single directory from a Blob Storage account that has a hierarchical na
 const syncCmdShortDescription = "Replicate source to the destination location"
 
 const syncCmdLongDescription = `
-The last modified times are used for comparison. The file is skipped if the last modified time in the destination is more recent. The supported pairs are:
+The last modified times are used for comparison. The file is skipped if the last modified time in the destination is more recent. Alternatively, you can use the --compare-hash flag to transfer only files which differ in their MD5 hash. The supported pairs are:
   
   - Local <-> Azure Blob / Azure File (either SAS or OAuth authentication can be used)
-  - Azure Blob <-> Azure Blob (Source must include a SAS or is publicly accessible; either SAS or OAuth authentication can be used for destination)
+  - Azure Blob <-> Azure Blob (either SAS or OAuth authentication can be used)
+  - ADLS Gen2 <-> ADLS Gen2 (either SAS or OAuth authentication can be used)
   - Azure File <-> Azure File (Source must include a SAS or is publicly accessible; SAS authentication should be used for destination)
   - Azure Blob <-> Azure File
 
@@ -404,7 +412,7 @@ The built-in lookup table is small but on Unix it is augmented by the local syst
 
 On Windows, MIME types are extracted from the registry.
 
-Please also note that sync works off of the last modified times exclusively. So in the case of Azure File <-> Azure File,
+By default, sync works off of the last modified times unless you override that default behavior by using the --compare-hash flag. So in the case of Azure File <-> Azure File,
 the header field Last-Modified is used instead of x-ms-file-change-time, which means that metadata changes at the source can also trigger a full copy.
 `
 
@@ -524,4 +532,48 @@ Run a benchmark test that downloads existing files from a target
 Run an upload that does not delete the transferred files. (These files can then serve as the payload for a download test)
 
    - azcopy bench "https://[account].blob.core.windows.net/[container]?<SAS>" --file-count 100 --delete-test-data=false
+`
+
+// ===================================== SET-PROPERTIES COMMAND ===================================== //
+
+const setPropertiesCmdShortDescription = "(Preview) Given a location, change all the valid system properties of that storage (blob or file)"
+
+const setPropertiesCmdLongDescription = `
+(Preview) Sets properties of Blob, ADLS Gen2, and File storage. The properties currently supported by this command are:
+
+	Blobs -> Tier, Metadata, Tags
+	ADLS Gen2 -> Tier, Metadata, Tags
+	Files -> Metadata
+Note: dfs endpoints will be replaced by blob endpoints.
+`
+
+const setPropertiesCmdExample = `
+Change tier of blob to hot:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --block-blob-tier=hot
+
+Change tier of blob to Cold:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --block-blob-tier=cold
+
+Change tier of blob from archive to cool with rehydrate priority set to high:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --block-blob-tier=cool --rehydrate-priority=high
+
+Change tier of all files in a directory to archive:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --block-blob-tier=archive --recursive=true
+
+Change metadata of blob to {key = "abc", val = "def"} and {key = "ghi", val = "jkl"}:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --metadata=abc=def;ghi=jkl
+
+Change metadata of all files in a directory to {key = "abc", val = "def"} and {key = "ghi", val = "jkl"}:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/virtual/dir]" --metadata=abc=def;ghi=jkl --recursive=true
+
+Clear all existing metadata of blob:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --metadata=clear
+
+Change blob-tags of blob to {key = "abc", val = "def"} and {key = "ghi", val = "jkl"}:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --blob-tags=abc=def&ghi=jkl
+	- While setting tags on the blobs, there are additional permissions('t' for tags) in SAS without which the service will give authorization error back.
+
+Clear all existing blob-tags of blob:
+	- azcopy set-properties "https://[account].blob.core.windows.net/[container]/[path/to/blob]" --blob-tags=clear
+	- While setting tags on the blobs, there are additional permissions('t' for tags) in SAS without which the service will give authorization error back.
 `

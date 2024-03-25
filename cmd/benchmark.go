@@ -23,15 +23,14 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"net/url"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake"
+	sharefile "github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/file"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/Azure/azure-storage-azcopy/v10/azbfs"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/Azure/azure-storage-file-go/azfile"
 	"github.com/spf13/cobra"
 )
 
@@ -47,13 +46,12 @@ type rawBenchmarkCmdArgs struct {
 	numOfFolders   uint
 
 	// options from flags
-	blockSizeMB  float64
-	putMd5       bool
-	checkLength  bool
-	blobType     string
-	output       string
-	logVerbosity string
-	mode         string
+	blockSizeMB float64
+	putMd5      bool
+	checkLength bool
+	blobType    string
+	output      string
+	mode        string
 }
 
 const (
@@ -153,7 +151,6 @@ func (raw rawBenchmarkCmdArgs) cook() (CookedCopyCmdArgs, error) {
 	c.CheckLength = raw.checkLength
 	c.blobType = raw.blobType
 	c.output = raw.output
-	c.logVerbosity = raw.logVerbosity
 
 	cooked, err := c.cook()
 	if err != nil {
@@ -168,7 +165,7 @@ func (raw rawBenchmarkCmdArgs) cook() (CookedCopyCmdArgs, error) {
 
 	if !downloadMode && raw.deleteTestData {
 		// set up automatic cleanup
-		cooked.followupJobArgs, err = raw.createCleanupJobArgs(cooked.Destination, raw.logVerbosity)
+		cooked.followupJobArgs, err = raw.createCleanupJobArgs(cooked.Destination, logVerbosityRaw)
 		if err != nil {
 			return dummyCooked, err
 		}
@@ -178,43 +175,43 @@ func (raw rawBenchmarkCmdArgs) cook() (CookedCopyCmdArgs, error) {
 }
 
 func (raw rawBenchmarkCmdArgs) appendVirtualDir(target, virtualDir string) (string, error) {
-
-	u, err := url.Parse(target)
-	if err != nil {
-		return "", fmt.Errorf("error parsing the url %s. Failed with error %s", target, err.Error())
-	}
-
-	var result url.URL
-
 	switch InferArgumentLocation(target) {
 	case common.ELocation.Blob():
-		p := azblob.NewBlobURLParts(*u)
+		p, err := blob.ParseURL(target)
+		if err != nil {
+			return "", fmt.Errorf("error parsing the url %s. Failed with error %s", target, err.Error())
+		}
 		if p.ContainerName == "" || p.BlobName != "" {
 			return "", errors.New("the blob target must be a container")
 		}
 		p.BlobName = virtualDir
-		result = p.URL()
+		return p.String(), err
 
 	case common.ELocation.File():
-		p := azfile.NewFileURLParts(*u)
+		p, err := sharefile.ParseURL(target)
+		if err != nil {
+			return "", fmt.Errorf("error parsing the url %s. Failed with error %s", target, err.Error())
+		}
 		if p.ShareName == "" || p.DirectoryOrFilePath != "" {
-			return "", errors.New("the Azure Files target must be a file share root")
+			return "", errors.New("the file share target must be a file share root")
 		}
 		p.DirectoryOrFilePath = virtualDir
-		result = p.URL()
+		return p.String(), err
 
 	case common.ELocation.BlobFS():
-		p := azbfs.NewBfsURLParts(*u)
-		if p.FileSystemName == "" || p.DirectoryOrFilePath != "" {
-			return "", errors.New("the blobFS target must be a file system")
+		p, err := azdatalake.ParseURL(target)
+		if err != nil {
+			return "", fmt.Errorf("error parsing the url %s. Failed with error %s", target, err.Error())
 		}
-		p.DirectoryOrFilePath = virtualDir
-		result = p.URL()
+		if p.FileSystemName == "" || p.PathName != "" {
+			return "", errors.New("the blobFS target must be a filesystem")
+		}
+		p.PathName = virtualDir
+		return p.String(), err
 	default:
 		return "", errors.New("benchmarking only supports https connections to Blob, Azure Files, and ADLS Gen2")
 	}
 
-	return result.String(), nil
 }
 
 // define a cleanup job
@@ -225,7 +222,6 @@ func (raw rawBenchmarkCmdArgs) createCleanupJobArgs(benchmarkDest common.Resourc
 	u, _ := benchmarkDest.FullURL() // don't check error, because it was parsed already in main job
 	rc.src = u.String()             // the SOURCE for the deletion is the the dest from the benchmark
 	rc.recursive = true
-	rc.logVerbosity = logVerbosity
 
 	switch InferArgumentLocation(rc.src) {
 	case common.ELocation.Blob():
@@ -276,7 +272,7 @@ func (h benchmarkSourceHelper) FromUrl(s string) (fileCount uint, bytesPerFile i
 	pieces[0] = strings.Split(pieces[0], "=")[1]
 	pieces[1] = strings.Split(pieces[1], "=")[1]
 	pieces[2] = strings.Split(pieces[2], "=")[1]
-	fc, err := strconv.ParseUint(pieces[0], 10, 64)
+	fc, err := strconv.ParseUint(pieces[0], 10, 32)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -284,7 +280,7 @@ func (h benchmarkSourceHelper) FromUrl(s string) (fileCount uint, bytesPerFile i
 	if err != nil {
 		return 0, 0, 0, err
 	}
-	nf, err := strconv.ParseUint(pieces[2], 10, 64)
+	nf, err := strconv.ParseUint(pieces[2], 10, 32)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -345,8 +341,4 @@ func init() {
 	benchCmd.PersistentFlags().BoolVar(&raw.putMd5, "put-md5", false, "create an MD5 hash of each file, and save the hash as the Content-MD5 property of the destination blob/file. (By default the hash is NOT created.) Identical to the same-named parameter in the copy command")
 	benchCmd.PersistentFlags().BoolVar(&raw.checkLength, "check-length", true, "Check the length of a file on the destination after the transfer. If there is a mismatch between source and destination, the transfer is marked as failed.")
 	benchCmd.PersistentFlags().StringVar(&raw.mode, "mode", "upload", "Defines if Azcopy should test uploads or downloads from this target. Valid values are 'upload' and 'download'. Defaulted option is 'upload'.")
-
-	// TODO use constant for default value or, better, move loglevel param to root cmd?
-	benchCmd.PersistentFlags().StringVar(&raw.logVerbosity, "log-level", "INFO", "define the log verbosity for the log file, available levels: INFO(all requests/responses), WARNING(slow responses), ERROR(only failed requests), and NONE(no output logs).")
-
 }

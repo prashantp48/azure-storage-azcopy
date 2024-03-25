@@ -22,17 +22,16 @@ package cmd
 
 import (
 	"context"
-	"net/url"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/service"
 	"strings"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 type blobVersionsTraverser struct {
-	rawURL                      *url.URL
-	p                           pipeline.Pipeline
+	rawURL                      string
+	serviceClient               *service.Client
 	ctx                         context.Context
 	includeDirectoryStubs       bool
 	incrementEnumerationCounter enumerationCounterFunc
@@ -40,37 +39,42 @@ type blobVersionsTraverser struct {
 	cpkOptions                  common.CpkOptions
 }
 
-func (t *blobVersionsTraverser) IsDirectory(isSource bool) bool {
+func (t *blobVersionsTraverser) IsDirectory(isSource bool) (bool, error) {
 	isDirDirect := copyHandlerUtil{}.urlIsContainerOrVirtualDirectory(t.rawURL)
 
 	// Skip the single blob check if we're checking a destination.
 	// This is an individual exception for blob because blob supports virtual directories and blobs sharing the same name.
 	if isDirDirect || !isSource {
-		return isDirDirect
+		return isDirDirect, nil
 	}
 
 	// The base blob may not exist in some cases.
-	return false
+	return false, nil
 }
 
-func (t *blobVersionsTraverser) getBlobProperties(versionID string) (props *azblob.BlobGetPropertiesResponse, err error) {
-	blobURLParts := azblob.NewBlobURLParts(*t.rawURL)
+func (t *blobVersionsTraverser) getBlobProperties(versionID string) (*blob.GetPropertiesResponse, error) {
+	blobURLParts, err := blob.ParseURL(t.rawURL)
+	if err != nil {
+		return nil, err
+	}
 	blobURLParts.BlobName = strings.TrimSuffix(blobURLParts.BlobName, common.AZCOPY_PATH_SEPARATOR_STRING)
 	if versionID != "" {
 		blobURLParts.VersionID = versionID
 	}
 
-	blobURL := azblob.NewBlobURL(blobURLParts.URL(), t.p)
-	clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-	if t.cpkOptions.IsSourceEncrypted {
-		clientProvidedKey = common.GetClientProvidedKey(t.cpkOptions)
+	blobClient, err := createBlobClientFromServiceClient(blobURLParts, t.serviceClient)
+	if err != nil {
+		return nil, err
 	}
-	props, err = blobURL.GetProperties(t.ctx, azblob.BlobAccessConditions{}, clientProvidedKey)
-	return props, err
+	props, err := blobClient.GetProperties(t.ctx, &blob.GetPropertiesOptions{CPKInfo: t.cpkOptions.GetCPKInfo()})
+	return &props, err
 }
 
 func (t *blobVersionsTraverser) Traverse(preprocessor objectMorpher, processor objectProcessor, filters []ObjectFilter) (err error) {
-	blobURLParts := azblob.NewBlobURLParts(*t.rawURL)
+	blobURLParts, err := blob.ParseURL(t.rawURL)
+	if err != nil {
+		return err
+	}
 
 	versionID, ok := <-t.listOfVersionIds
 	for ; ok; versionID, ok = <-t.listOfVersionIds {
@@ -89,11 +93,11 @@ func (t *blobVersionsTraverser) Traverse(preprocessor objectMorpher, processor o
 			getObjectNameOnly(strings.TrimSuffix(blobURLParts.BlobName, common.AZCOPY_PATH_SEPARATOR_STRING)),
 			"",
 			common.EEntityType.File(),
-			blobProperties.LastModified(),
-			blobProperties.ContentLength(),
-			blobProperties,
+			*blobProperties.LastModified,
+			*blobProperties.ContentLength,
 			blobPropertiesResponseAdapter{blobProperties},
-			common.FromAzBlobMetadataToCommonMetadata(blobProperties.NewMetadata()),
+			blobPropertiesResponseAdapter{blobProperties},
+			blobProperties.Metadata,
 			blobURLParts.ContainerName,
 		)
 		storedObject.blobVersionID = versionID
@@ -110,13 +114,13 @@ func (t *blobVersionsTraverser) Traverse(preprocessor objectMorpher, processor o
 	return nil
 }
 
-func newBlobVersionsTraverser(rawURL *url.URL, p pipeline.Pipeline, ctx context.Context,
-	recursive, includeDirectoryStubs bool, incrementEnumerationCounter enumerationCounterFunc,
+func newBlobVersionsTraverser(rawURL string, serviceClient *service.Client, ctx context.Context,
+	includeDirectoryStubs bool, incrementEnumerationCounter enumerationCounterFunc,
 	listOfVersionIds chan string, cpkOptions common.CpkOptions) (t *blobVersionsTraverser) {
 
 	return &blobVersionsTraverser{
 		rawURL:                      rawURL,
-		p:                           p,
+		serviceClient:               serviceClient,
 		ctx:                         ctx,
 		includeDirectoryStubs:       includeDirectoryStubs,
 		incrementEnumerationCounter: incrementEnumerationCounter,

@@ -6,7 +6,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	datalake "github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/service"
+
 	"github.com/JeffreyRichter/enum/enum"
 )
 
@@ -40,7 +42,7 @@ func (c *RpcCmd) Parse(s string) error {
 	return err
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// ////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // ResourceString represents a source or dest string, that can have
 // three parts: the main part, a sas, and extra query parameters that are not part of the sas.
@@ -74,6 +76,15 @@ func (r ResourceString) FullURL() (*url.URL, error) {
 	return u, err
 }
 
+func (r ResourceString) String() (string, error) {
+	u, err := r.FullURL()
+	if err != nil {
+		return "", err
+	} else {
+		return u.String(), nil
+	}
+}
+
 // to be used when the value is assumed to be a local path
 // Using this signals "Yes, I really am ignoring the SAS and ExtraQuery on purpose",
 // and will result in a panic in the case of programmer error of calling this method
@@ -105,34 +116,42 @@ func ConsolidatePathSeparators(path string) string {
 	return strings.ReplaceAll(path, AZCOPY_PATH_SEPARATOR_STRING, pathSep)
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-//Transfers describes each file/folder being transferred in a given JobPartOrder, and
-//other auxilliary details of this order.
+// Transfers describes each file/folder being transferred in a given JobPartOrder, and
+// other auxiliary details of this order.
 type Transfers struct {
-	List                []CopyTransfer
-	TotalSizeInBytes    uint64
-	FileTransferCount   uint32
-	FolderTransferCount uint32
+	List                 []CopyTransfer
+	TotalSizeInBytes     uint64
+	FileTransferCount    uint32
+	FolderTransferCount  uint32
+	SymlinkTransferCount uint32
 }
 
 // This struct represents the job info (a single part) to be sent to the storage engine
 type CopyJobPartOrderRequest struct {
-	Version         Version         // version of azcopy
-	JobID           JobID           // Guid - job identifier
-	PartNum         PartNumber      // part number of the job
-	IsFinalPart     bool            // to determine the final part for a specific job
-	ForceWrite      OverwriteOption // to determine if the existing needs to be overwritten or not. If set to true, existing blobs are overwritten
-	ForceIfReadOnly bool            // Supplements ForceWrite with addition setting for Azure Files objects with read-only attribute
-	AutoDecompress  bool            // if true, source data with encodings that represent compression are automatically decompressed when downloading
-	Priority        JobPriority     // priority of the task
-	FromTo          FromTo
-	Fpo             FolderPropertyOption // passed in from front-end to ensure that front-end and STE agree on the desired behaviour for the job
+	Version             Version         // version of azcopy
+	JobID               JobID           // Guid - job identifier
+	PartNum             PartNumber      // part number of the job
+	IsFinalPart         bool            // to determine the final part for a specific job
+	ForceWrite          OverwriteOption // to determine if the existing needs to be overwritten or not. If set to true, existing blobs are overwritten
+	ForceIfReadOnly     bool            // Supplements ForceWrite with addition setting for Azure Files objects with read-only attribute
+	AutoDecompress      bool            // if true, source data with encodings that represent compression are automatically decompressed when downloading
+	Priority            JobPriority     // priority of the task
+	FromTo              FromTo
+	Fpo                 FolderPropertyOption // passed in from front-end to ensure that front-end and STE agree on the desired behaviour for the job
+	SymlinkHandlingType SymlinkHandlingType
 	// list of blobTypes to exclude.
-	ExcludeBlobType []azblob.BlobType
+	ExcludeBlobType []blob.BlobType
 
-	SourceRoot      ResourceString
-	DestinationRoot ResourceString
+	SourceRoot       ResourceString
+	DestinationRoot  ResourceString
+	SrcServiceClient *ServiceClient
+	DstServiceClient *ServiceClient
+
+	//These clients are required only in S2S transfers from/to datalake
+	SrcDatalakeClient *datalake.Client
+	DstDatalakeClient *datalake.Client
 
 	Transfers      Transfers
 	LogLevel       LogLevel
@@ -142,21 +161,36 @@ type CopyJobPartOrderRequest struct {
 
 	PreserveSMBPermissions         PreservePermissionsOption
 	PreserveSMBInfo                bool
+	PreservePOSIXProperties        bool
 	S2SGetPropertiesInBackend      bool
 	S2SSourceChangeValidation      bool
 	DestLengthValidation           bool
 	S2SInvalidMetadataHandleOption InvalidMetadataHandleOption
 	S2SPreserveBlobTags            bool
 	CpkOptions                     CpkOptions
+	SetPropertiesFlags             SetPropertiesFlags
+	BlobFSRecursiveDelete          bool
+
+	// S2SSourceCredentialType will override CredentialInfo.CredentialType for use on the source.
+	// As a result, CredentialInfo.OAuthTokenInfo may end up being fulfilled even _if_ CredentialInfo.CredentialType is _not_ OAuth.
+	// This may not always be the case (for instance, if we opt to use multiple OAuth tokens). At that point, this will likely be it's own CredentialInfo.
+	S2SSourceCredentialType CredentialType // Only Anonymous and OAuth will really be used in response to this, but S3 and GCP will come along too...
+	FileAttributes          FileTransferAttributes
 }
 
 // CredentialInfo contains essential credential info which need be transited between modules,
 // and used during creating Azure storage client Credential.
 type CredentialInfo struct {
-	CredentialType    CredentialType
-	OAuthTokenInfo    OAuthTokenInfo
-	S3CredentialInfo  S3CredentialInfo
-	GCPCredentialInfo GCPCredentialInfo
+	CredentialType           CredentialType
+	OAuthTokenInfo           OAuthTokenInfo
+	S3CredentialInfo         S3CredentialInfo
+	GCPCredentialInfo        GCPCredentialInfo
+}
+
+func (c CredentialInfo) WithType(credentialType CredentialType) CredentialInfo {
+	// c is a clone, so this is OK
+	c.CredentialType = credentialType
+	return c
 }
 
 type GCPCredentialInfo struct {
@@ -190,23 +224,30 @@ type ListRequest struct {
 
 // This struct represents the optional attribute for blob request header
 type BlobTransferAttributes struct {
-	BlobType                 BlobType              // The type of a blob - BlockBlob, PageBlob, AppendBlob
-	ContentType              string                // The content type specified for the blob.
-	ContentEncoding          string                // Specifies which content encodings have been applied to the blob.
-	ContentLanguage          string                // Specifies the language of the content
-	ContentDisposition       string                // Specifies the content disposition
-	CacheControl             string                // Specifies the cache control header
-	BlockBlobTier            BlockBlobTier         // Specifies the tier to set on the block blobs.
-	PageBlobTier             PageBlobTier          // Specifies the tier to set on the page blobs.
-	Metadata                 string                // User-defined Name-value pairs associated with the blob
-	NoGuessMimeType          bool                  // represents user decision to interpret the content-encoding from source file
-	PreserveLastModifiedTime bool                  // when downloading, tell engine to set file's timestamp to timestamp of blob
-	PutMd5                   bool                  // when uploading, should we create and PUT Content-MD5 hashes
-	MD5ValidationOption      HashValidationOption  // when downloading, how strictly should we validate MD5 hashes?
-	BlockSizeInBytes         int64                 // when uploading/downloading/copying, specify the size of each chunk
-	DeleteSnapshotsOption    DeleteSnapshotsOption // when deleting, specify what to do with the snapshots
-	BlobTagsString           string                // when user explicitly provides blob tags
-	PermanentDeleteOption    PermanentDeleteOption // Permanently deletes soft-deleted snapshots when indicated by user
+	BlobType                         BlobType              // The type of a blob - BlockBlob, PageBlob, AppendBlob
+	ContentType                      string                // The content type specified for the blob.
+	ContentEncoding                  string                // Specifies which content encodings have been applied to the blob.
+	ContentLanguage                  string                // Specifies the language of the content
+	ContentDisposition               string                // Specifies the content disposition
+	CacheControl                     string                // Specifies the cache control header
+	BlockBlobTier                    BlockBlobTier         // Specifies the tier to set on the block blobs.
+	PageBlobTier                     PageBlobTier          // Specifies the tier to set on the page blobs.
+	Metadata                         string                // User-defined Name-value pairs associated with the blob
+	NoGuessMimeType                  bool                  // represents user decision to interpret the content-encoding from source file
+	PreserveLastModifiedTime         bool                  // when downloading, tell engine to set file's timestamp to timestamp of blob
+	PutMd5                           bool                  // when uploading, should we create and PUT Content-MD5 hashes
+	MD5ValidationOption              HashValidationOption  // when downloading, how strictly should we validate MD5 hashes?
+	BlockSizeInBytes                 int64                 // when uploading/downloading/copying, specify the size of each chunk
+	DeleteSnapshotsOption            DeleteSnapshotsOption // when deleting, specify what to do with the snapshots
+	BlobTagsString                   string                // when user explicitly provides blob tags
+	PermanentDeleteOption            PermanentDeleteOption // Permanently deletes soft-deleted snapshots when indicated by user
+	RehydratePriority                RehydratePriorityType // rehydrate priority of blob
+	DeleteDestinationFileIfNecessary bool                  // deletes the dst blob if indicated
+}
+
+// This struct represents the optional attribute for file request header
+type FileTransferAttributes struct {
+	TrailingDot TrailingDotOption
 }
 
 type JobIDDetails struct {
@@ -245,9 +286,13 @@ type ListJobSummaryResponse struct {
 	// FileTransfers.
 	FileTransfers           uint32 `json:",string"`
 	FolderPropertyTransfers uint32 `json:",string"`
+	SymlinkTransfers        uint32 `json:",string"`
 
+	FoldersCompleted   uint32 `json:",string"` // Files can be figured out by TransfersCompleted - FoldersCompleted
 	TransfersCompleted uint32 `json:",string"`
+	FoldersFailed      uint32 `json:",string"`
 	TransfersFailed    uint32 `json:",string"`
+	FoldersSkipped     uint32 `json:",string"`
 	TransfersSkipped   uint32 `json:",string"`
 
 	// includes bytes sent in retries (i.e. has double counting, if there are retries) and in failed transfers
@@ -293,12 +338,14 @@ type ListJobTransfersRequest struct {
 }
 
 type ResumeJobRequest struct {
-	JobID           JobID
-	SourceSAS       string
-	DestinationSAS  string
-	IncludeTransfer map[string]int
-	ExcludeTransfer map[string]int
-	CredentialInfo  CredentialInfo
+	JobID            JobID
+	SourceSAS        string
+	DestinationSAS   string
+	SrcServiceClient *ServiceClient
+	DstServiceClient *ServiceClient
+	IncludeTransfer  map[string]int
+	ExcludeTransfer  map[string]int
+	CredentialInfo   CredentialInfo
 }
 
 // represents the Details and details of a single transfer
@@ -314,6 +361,7 @@ type TransferDetail struct {
 type CancelPauseResumeResponse struct {
 	ErrorMsg              string
 	CancelledPauseResumed bool
+	JobStatus             JobStatus
 }
 
 // represents the list of Details and details of number of transfers

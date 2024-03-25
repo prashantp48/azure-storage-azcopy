@@ -26,10 +26,8 @@ import (
 	"os"
 	"path"
 	"runtime"
-	"runtime/debug"
 	"time"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/cmd"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -38,40 +36,44 @@ import (
 var glcm = common.GetLifecycleMgr()
 
 func main() {
-	pipeline.SetLogSanitizer(common.NewAzCopyLogSanitizer()) // make sure SyslogDisabled logs get secrets redacted
-
 	rand.Seed(time.Now().UnixNano()) // make sure our random numbers actually are random (but remember, use crypto/rand for anything where strong/reliable randomness is required
 
+	azcopyLogPathFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.LogLocation())     // user specified location for log files
+	azcopyJobPlanFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.JobPlanLocation()) // user specified location for plan files
+
 	// note: azcopyAppPathFolder is the default location for all AzCopy data (logs, job plans, oauth token on Windows)
-	// but both logs and job plans can be put elsewhere as they can become very large
+	// but all the above can be put elsewhere as they can become very large
 	azcopyAppPathFolder := GetAzCopyAppPath()
 
 	// the user can optionally put the log files somewhere else
-	azcopyLogPathFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.LogLocation())
 	if azcopyLogPathFolder == "" {
 		azcopyLogPathFolder = azcopyAppPathFolder
 	}
 	if err := os.Mkdir(azcopyLogPathFolder, os.ModeDir|os.ModePerm); err != nil && !os.IsExist(err) {
-		common.PanicIfErr(err)
+		log.Fatalf("Problem making .azcopy directory. Try setting AZCOPY_LOG_LOCATION env variable. %v", err)
 	}
 
 	// the user can optionally put the plan files somewhere else
-	azcopyJobPlanFolder := common.GetLifecycleMgr().GetEnvironmentVariable(common.EEnvironmentVariable.JobPlanLocation())
 	if azcopyJobPlanFolder == "" {
+		// make the app path folder ".azcopy" first so we can make a plans folder in it
+		if err := os.MkdirAll(azcopyAppPathFolder, os.ModeDir); err != nil && !os.IsExist(err) {
+			log.Fatalf("Problem making .azcopy directory. Try setting AZCOPY_JOB_PLAN_LOCATION env variable. %v", err)
+		}
 		azcopyJobPlanFolder = path.Join(azcopyAppPathFolder, "plans")
 	}
-	if err := os.Mkdir(azcopyJobPlanFolder, os.ModeDir|os.ModePerm); err != nil && !os.IsExist(err) {
-		common.PanicIfErr(err)
+
+	if err := os.MkdirAll(azcopyJobPlanFolder, os.ModeDir|os.ModePerm); err != nil && !os.IsExist(err) {
+		log.Fatalf("Problem making .azcopy directory. Try setting AZCOPY_JOB_PLAN_LOCATION env variable. %v", err)
 	}
 
+	jobID := common.NewJobID()
 	// If insufficient arguments, show usage & terminate
 	if len(os.Args) == 1 {
-		cmd.Execute(azcopyAppPathFolder, azcopyLogPathFolder, azcopyJobPlanFolder, 0)
+		cmd.Execute(azcopyLogPathFolder, azcopyJobPlanFolder, 0, jobID)
 		return
 	}
 
 	configureGoMaxProcs()
-	configureGC()
 
 	// Perform os specific initialization
 	maxFileAndSocketHandles, err := ProcessOSSpecificInitialization()
@@ -79,18 +81,8 @@ func main() {
 		log.Fatalf("initialization failed: %v", err)
 	}
 
-	cmd.Execute(azcopyAppPathFolder, azcopyLogPathFolder, azcopyJobPlanFolder, maxFileAndSocketHandles)
+	cmd.Execute(azcopyLogPathFolder, azcopyJobPlanFolder, maxFileAndSocketHandles, jobID)
 	glcm.Exit(nil, common.EExitCode.Success())
-}
-
-// Golang's default behaviour is to GC when new objects = (100% of) total of objects surviving previous GC.
-// But our "survivors" add up to many GB, so its hard for users to be confident that we don't have
-// a memory leak (since with that default setting new GCs are very rare in our case). So configure them to be more frequent.
-func configureGC() {
-	go func() {
-		time.Sleep(20 * time.Second) // wait a little, so that our initial pool of buffers can get allocated without heaps of (unnecessary) GC activity
-		debug.SetGCPercent(20)       // activate more aggressive/frequent GC than the default
-	}()
 }
 
 // Ensure we always have more than 1 OS thread running goroutines, since there are issues with having just 1.

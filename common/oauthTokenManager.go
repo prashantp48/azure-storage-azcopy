@@ -21,49 +21,42 @@
 package common
 
 import (
-	"bufio"
 	"context"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
-	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
-	"golang.org/x/crypto/pkcs12"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/go-autorest/autorest/date"
 
 	"github.com/Azure/go-autorest/autorest/adal"
 )
 
 // ApplicationID represents 1st party ApplicationID for AzCopy.
-//const ApplicationID = "a45c21f4-7066-40b4-97d8-14f4313c3caa" // 3rd party test ApplicationID for AzCopy.
+// const ApplicationID = "a45c21f4-7066-40b4-97d8-14f4313c3caa" // 3rd party test ApplicationID for AzCopy.
 const ApplicationID = "579a7132-0e58-4d80-b1e1-7a1e2d337859"
 
 // Resource used in azure storage OAuth authentication
 const Resource = "https://storage.azure.com"
+const MDResource = "https://disk.azure.com/" // There must be a trailing slash-- The service checks explicitly for "https://disk.azure.com/"
+
+const StorageScope = "https://storage.azure.com/.default"
+const ManagedDiskScope = "https://disk.azure.com//.default" // There must be a trailing slash-- The service checks explicitly for "https://disk.azure.com/"
+
 const DefaultTenantID = "common"
 const DefaultActiveDirectoryEndpoint = "https://login.microsoftonline.com"
-const IMDSAPIVersionArcVM = "2019-11-01"
-const IMDSAPIVersionAzureVM = "2018-02-01"
-const MSIEndpointAzureVM = "http://169.254.169.254/metadata/identity/oauth2/token"
-const MSIEndpointArcVM = "http://127.0.0.1:40342/metadata/identity/oauth2/token"
-
-// Refer to https://docs.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2 for details
-const WSAECONNREFUSED = 10061
-
-var DefaultTokenExpiryWithinThreshold = time.Minute * 10
 
 // UserOAuthTokenManager for token management.
 type UserOAuthTokenManager struct {
@@ -100,16 +93,17 @@ func newAzcopyHTTPClient() *http.Client {
 			DisableKeepAlives:      false,
 			DisableCompression:     true,
 			MaxResponseHeaderBytes: 0,
-			//ResponseHeaderTimeout:  time.Duration{},
-			//ExpectContinueTimeout:  time.Duration{},
+			// ResponseHeaderTimeout:  time.Duration{},
+			// ExpectContinueTimeout:  time.Duration{},
 		},
 	}
 }
 
 // GetTokenInfo gets token info, it follows rule:
-// 1. If there is token passed from environment variable(note this is only for testing purpose),
-//    use token passed from environment variable.
-// 2. Otherwise, try to get token from cache.
+//  1. If there is token passed from environment variable(note this is only for testing purpose),
+//     use token passed from environment variable.
+//  2. Otherwise, try to get token from cache.
+//
 // This method either successfully return token, or return error.
 func (uotm *UserOAuthTokenManager) GetTokenInfo(ctx context.Context) (*OAuthTokenInfo, error) {
 	if uotm.stashedInfo != nil {
@@ -139,299 +133,110 @@ func (uotm *UserOAuthTokenManager) GetTokenInfo(ctx context.Context) (*OAuthToke
 	return tokenInfo, nil
 }
 
+func (uotm *UserOAuthTokenManager) validateAndPersistLogin(oAuthTokenInfo *OAuthTokenInfo, persist bool) error {
+	// Use default tenant ID and active directory endpoint, if nothing specified.
+	if oAuthTokenInfo.Tenant == "" {
+		oAuthTokenInfo.Tenant = DefaultTenantID
+	}
+	if oAuthTokenInfo.ActiveDirectoryEndpoint == "" {
+		oAuthTokenInfo.ActiveDirectoryEndpoint = DefaultActiveDirectoryEndpoint
+	}
+	tc, err := oAuthTokenInfo.GetTokenCredential()
+	if err != nil {
+		return err
+	}
+	scopes := []string{StorageScope}
+	_, err = tc.GetToken(context.TODO(), policy.TokenRequestOptions{Scopes: scopes})
+	if err != nil {
+		return err
+	}
+	uotm.stashedInfo = oAuthTokenInfo
+
+	if persist && err == nil {
+		err = uotm.credCache.SaveToken(*oAuthTokenInfo)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (uotm *UserOAuthTokenManager) AzCliLogin(tenantID string) error {
+	oAuthTokenInfo := &OAuthTokenInfo{
+		AzCLICred: true,
+		Tenant:    tenantID,
+	}
+
+	// CLI creds will not be persisted. AzCLI would have already persistd that
+	return uotm.validateAndPersistLogin(oAuthTokenInfo, false)
+}
+
+func (uotm *UserOAuthTokenManager) PSContextToken(tenantID string) error {
+	oAuthTokenInfo := &OAuthTokenInfo {
+		PSCred: true,
+		Tenant: tenantID,
+	}
+
+	return uotm.validateAndPersistLogin(oAuthTokenInfo, false)
+}
 // MSILogin tries to get token from MSI, persist indicates whether to cache the token on local disk.
-func (uotm *UserOAuthTokenManager) MSILogin(ctx context.Context, identityInfo IdentityInfo, persist bool) (*OAuthTokenInfo, error) {
+func (uotm *UserOAuthTokenManager) MSILogin(identityInfo IdentityInfo, persist bool) error {
 	if err := identityInfo.Validate(); err != nil {
-		return nil, err
+		return err
 	}
 
 	oAuthTokenInfo := &OAuthTokenInfo{
 		Identity:     true,
 		IdentityInfo: identityInfo,
 	}
-	token, err := oAuthTokenInfo.GetNewTokenFromMSI(ctx)
-	if err != nil {
-		return nil, err
-	}
-	oAuthTokenInfo.Token = *token
-	uotm.stashedInfo = oAuthTokenInfo
 
-	if persist {
-		err = uotm.credCache.SaveToken(*oAuthTokenInfo)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return oAuthTokenInfo, nil
-}
-
-// secretLoginNoUOTM non-interactively logs in with a client secret.
-func secretLoginNoUOTM(tenantID, activeDirectoryEndpoint, secret, applicationID string) (*OAuthTokenInfo, error) {
-	if tenantID == "" {
-		tenantID = DefaultTenantID
-	}
-
-	if activeDirectoryEndpoint == "" {
-		activeDirectoryEndpoint = DefaultActiveDirectoryEndpoint
-	}
-
-	if applicationID == "" {
-		return nil, fmt.Errorf("please supply your OWN application ID")
-	}
-
-	oAuthTokenInfo := OAuthTokenInfo{
-		Tenant:                  tenantID,
-		ActiveDirectoryEndpoint: activeDirectoryEndpoint,
-	}
-
-	oauthConfig, err := adal.NewOAuthConfig(activeDirectoryEndpoint, tenantID)
-	if err != nil {
-		return nil, err
-	}
-
-	spt, err := adal.NewServicePrincipalToken(
-		*oauthConfig,
-		applicationID,
-		secret,
-		Resource,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	err = spt.Refresh()
-	if err != nil {
-		return nil, err
-	}
-
-	// Due to the nature of SPA, no refresh token is given.
-	// Thus, no refresh token is copied or needed.
-	oAuthTokenInfo.Token = spt.Token()
-	oAuthTokenInfo.ApplicationID = applicationID
-	oAuthTokenInfo.ServicePrincipalName = true
-	oAuthTokenInfo.SPNInfo = SPNInfo{
-		Secret:   secret,
-		CertPath: "",
-	}
-
-	return &oAuthTokenInfo, nil
+	return uotm.validateAndPersistLogin(oAuthTokenInfo, persist)
 }
 
 // SecretLogin is a UOTM shell for secretLoginNoUOTM.
-func (uotm *UserOAuthTokenManager) SecretLogin(tenantID, activeDirectoryEndpoint, secret, applicationID string, persist bool) (*OAuthTokenInfo, error) {
-	oAuthTokenInfo, err := secretLoginNoUOTM(tenantID, activeDirectoryEndpoint, secret, applicationID)
-
-	if err != nil {
-		return nil, err
+func (uotm *UserOAuthTokenManager) SecretLogin(tenantID, activeDirectoryEndpoint, secret, applicationID string, persist bool) error {
+	oAuthTokenInfo := &OAuthTokenInfo{
+		ServicePrincipalName:    true,
+		Tenant:                  tenantID,
+		ActiveDirectoryEndpoint: activeDirectoryEndpoint,
+		ApplicationID:           applicationID,
+		SPNInfo: SPNInfo{
+			Secret:   secret,
+			CertPath: "",
+		},
 	}
 
-	uotm.stashedInfo = oAuthTokenInfo
-	if persist {
-		err = uotm.credCache.SaveToken(*oAuthTokenInfo)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return oAuthTokenInfo, nil
+	return uotm.validateAndPersistLogin(oAuthTokenInfo, persist)
 }
 
-// GetNewTokenFromSecret is a refresh shell for secretLoginNoUOTM
-func (credInfo *OAuthTokenInfo) GetNewTokenFromSecret(ctx context.Context) (*adal.Token, error) {
-	tokeninfo, err := secretLoginNoUOTM(credInfo.Tenant, credInfo.ActiveDirectoryEndpoint, credInfo.SPNInfo.Secret, credInfo.ApplicationID)
-
-	if err != nil {
-		return nil, err
-	} else {
-		return &tokeninfo.Token, nil
-	}
-}
-
-// Read a potentially encrypted PKCS block
-func readPKCSBlock(block *pem.Block, secret []byte, parseFunc func([]byte) (interface{}, error)) (pk interface{}, err error) {
-	// Reduce code duplication by baking the parse functions into this
-	if x509.IsEncryptedPEMBlock(block) {
-		data, err := x509.DecryptPEMBlock(block, secret)
-
-		if err == nil {
-			pk, err = parseFunc(data)
-
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	} else {
-		pk, err = parseFunc(block.Bytes)
-
-		if err != nil {
-			return nil, err
-		}
-	}
-	return pk, err
-}
-
-func certLoginNoUOTM(tenantID, activeDirectoryEndpoint, certPath, certPass, applicationID string) (*OAuthTokenInfo, error) {
+// CertLogin non-interactively logs in using a specified certificate, certificate password, and activedirectory endpoint.
+func (uotm *UserOAuthTokenManager) CertLogin(tenantID, activeDirectoryEndpoint, certPath, certPass, applicationID string, persist bool) error {
+	// Use default tenant ID and active directory endpoint, if nothing specified.
 	if tenantID == "" {
 		tenantID = DefaultTenantID
 	}
-
 	if activeDirectoryEndpoint == "" {
 		activeDirectoryEndpoint = DefaultActiveDirectoryEndpoint
 	}
-
-	if applicationID == "" {
-		return nil, fmt.Errorf("please supply your OWN application ID")
-	}
-
-	oAuthTokenInfo := OAuthTokenInfo{
+	absCertPath, _ := filepath.Abs(certPath)
+	oAuthTokenInfo := &OAuthTokenInfo{
+		ServicePrincipalName:    true,
 		Tenant:                  tenantID,
 		ActiveDirectoryEndpoint: activeDirectoryEndpoint,
+		ApplicationID:           applicationID,
+		SPNInfo: SPNInfo{
+			Secret:   certPass,
+			CertPath: absCertPath,
+		},
 	}
 
-	oauthConfig, err := adal.NewOAuthConfig(activeDirectoryEndpoint, tenantID)
-	if err != nil {
-		return nil, err
-	}
-
-	certData, err := ioutil.ReadFile(certPath)
-	if err != nil {
-		return nil, err
-	}
-
-	var pk interface{}
-	var cert *x509.Certificate
-
-	if path.Ext(certPath) == ".pfx" || path.Ext(certPath) == ".pkcs12" || path.Ext(certPath) == ".p12" {
-		pk, cert, err = pkcs12.Decode(certData, certPass)
-
-		if err != nil {
-			return nil, err
-		}
-	} else if path.Ext(certPath) == ".pem" {
-		block, rest := pem.Decode(certData)
-
-		for len(rest) != 0 || pk == nil || cert == nil {
-			if block != nil {
-				switch block.Type {
-				case "ENCRYPTED PRIVATE KEY":
-					pk, err = readPKCSBlock(block, []byte(certPass), x509.ParsePKCS8PrivateKey)
-
-					if err != nil {
-						return nil, fmt.Errorf("encrypted private key block has invalid format OR your cert password may be incorrect")
-					}
-				case "RSA PRIVATE KEY":
-					pkcs1wrap := func(d []byte) (pk interface{}, err error) {
-						return x509.ParsePKCS1PrivateKey(d) // Wrap this so that function signatures agree.
-					}
-
-					pk, err = readPKCSBlock(block, []byte(certPass), pkcs1wrap)
-
-					if err != nil {
-						return nil, fmt.Errorf("rsa private key block has invalid format OR your cert password may be incorrect")
-					}
-				case "PRIVATE KEY":
-					pk, err = readPKCSBlock(block, []byte(certPass), x509.ParsePKCS8PrivateKey)
-
-					if err != nil {
-						return nil, fmt.Errorf("private key block has invalid format")
-					}
-				case "CERTIFICATE":
-					tmpcert, err := x509.ParseCertificate(block.Bytes)
-
-					// Skip this certificate if it's invalid or is a CA cert
-					if err == nil && !tmpcert.IsCA {
-						cert = tmpcert
-					}
-				default:
-					// Ignore this part of the pem file, don't know what it is.
-				}
-			} else {
-				break
-			}
-
-			if len(rest) == 0 {
-				break
-			}
-
-			block, rest = pem.Decode(rest)
-		}
-
-		if pk == nil || cert == nil {
-			return nil, fmt.Errorf("could not find the required information (private key & cert) in the supplied .pem file")
-		}
-	} else {
-		return nil, fmt.Errorf("please supply either a .pfx, .pkcs12, .p12, or a .pem file containing a private key and a certificate")
-	}
-
-	p, ok := pk.(*rsa.PrivateKey)
-	if !ok {
-		return nil, fmt.Errorf("only RSA private keys are supported")
-	}
-
-	spt, err := adal.NewServicePrincipalTokenFromCertificate(
-		*oauthConfig,
-		applicationID,
-		cert,
-		p,
-		Resource,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	err = spt.Refresh()
-	if err != nil {
-		return nil, err
-	}
-
-	cpfq, _ := filepath.Abs(certPath)
-
-	oAuthTokenInfo.Token = spt.Token()
-	oAuthTokenInfo.RefreshToken = oAuthTokenInfo.Token.RefreshToken
-	oAuthTokenInfo.ApplicationID = applicationID
-	oAuthTokenInfo.ServicePrincipalName = true
-	oAuthTokenInfo.SPNInfo = SPNInfo{
-		Secret:   certPass,
-		CertPath: cpfq,
-	}
-
-	return &oAuthTokenInfo, nil
-}
-
-//CertLogin non-interactively logs in using a specified certificate, certificate password, and activedirectory endpoint.
-func (uotm *UserOAuthTokenManager) CertLogin(tenantID, activeDirectoryEndpoint, certPath, certPass, applicationID string, persist bool) (*OAuthTokenInfo, error) {
-	// TODO: Global default cert flag for true non interactive login?
-	// (Also could be useful if the user has multiple certificates they want to switch between in the same file.)
-	oAuthTokenInfo, err := certLoginNoUOTM(tenantID, activeDirectoryEndpoint, certPath, certPass, applicationID)
-	uotm.stashedInfo = oAuthTokenInfo
-
-	if persist && err == nil {
-		err = uotm.credCache.SaveToken(*oAuthTokenInfo)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return oAuthTokenInfo, err
-}
-
-//GetNewTokenFromCert refreshes a token manually from a certificate.
-func (credInfo *OAuthTokenInfo) GetNewTokenFromCert(ctx context.Context) (*adal.Token, error) {
-	tokeninfo, err := certLoginNoUOTM(credInfo.Tenant, credInfo.ActiveDirectoryEndpoint, credInfo.SPNInfo.CertPath, credInfo.SPNInfo.Secret, credInfo.ApplicationID)
-
-	if err != nil {
-		return nil, err
-	} else {
-		return &tokeninfo.Token, nil
-	}
+	return uotm.validateAndPersistLogin(oAuthTokenInfo, persist)
 }
 
 // UserLogin interactively logins in with specified tenantID and activeDirectoryEndpoint, persist indicates whether to
 // cache the token on local disk.
-func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint string, persist bool) (*OAuthTokenInfo, error) {
+func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint string, persist bool) error {
 	// Use default tenant ID and active directory endpoint, if nothing specified.
 	if tenantID == "" {
 		tenantID = DefaultTenantID
@@ -443,7 +248,7 @@ func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint s
 	// Init OAuth config
 	oauthConfig, err := adal.NewOAuthConfig(activeDirectoryEndpoint, tenantID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	// Acquire the device code
@@ -453,7 +258,7 @@ func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint s
 		ApplicationID,
 		Resource)
 	if err != nil {
-		return nil, fmt.Errorf("failed to login with tenantID %q, Azure directory endpoint %q, %v",
+		return fmt.Errorf("failed to login with tenantID %q, Azure directory endpoint %q, %v",
 			tenantID, activeDirectoryEndpoint, err)
 	}
 
@@ -469,7 +274,7 @@ func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint s
 	// TODO: check if adal Go SDK has new method which supports context, currently ctrl-C can stop the login in console interactively.
 	token, err := adal.WaitForUserCompletion(uotm.oauthClient, deviceCode)
 	if err != nil {
-		return nil, fmt.Errorf("failed to login with tenantID %q, Azure directory endpoint %q, %v",
+		return fmt.Errorf("failed to login with tenantID %q, Azure directory endpoint %q, %v",
 			tenantID, activeDirectoryEndpoint, err)
 	}
 
@@ -477,6 +282,7 @@ func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint s
 		Token:                   *token,
 		Tenant:                  tenantID,
 		ActiveDirectoryEndpoint: activeDirectoryEndpoint,
+		ApplicationID:           ApplicationID,
 	}
 	uotm.stashedInfo = &oAuthTokenInfo
 
@@ -487,17 +293,17 @@ func (uotm *UserOAuthTokenManager) UserLogin(tenantID, activeDirectoryEndpoint s
 	if persist {
 		err = uotm.credCache.SaveToken(oAuthTokenInfo)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return &oAuthTokenInfo, nil
+	return nil
 }
 
 // getCachedTokenInfo get a fresh token from local disk cache.
 // If access token is expired, it will refresh the token.
 // If refresh token is expired, the method will fail and return failure reason.
-// Fresh token is persisted if acces token or refresh token is changed.
+// Fresh token is persisted if access token or refresh token is changed.
 func (uotm *UserOAuthTokenManager) getCachedTokenInfo(ctx context.Context) (*OAuthTokenInfo, error) {
 	hasToken, err := uotm.credCache.HasCachedToken()
 	if err != nil {
@@ -530,6 +336,10 @@ func (uotm *UserOAuthTokenManager) getCachedTokenInfo(ctx context.Context) (*OAu
 
 // HasCachedToken returns if there is cached token in token manager.
 func (uotm *UserOAuthTokenManager) HasCachedToken() (bool, error) {
+	if uotm.stashedInfo != nil {
+		return true, nil
+	}
+
 	return uotm.credCache.HasCachedToken()
 }
 
@@ -538,7 +348,7 @@ func (uotm *UserOAuthTokenManager) RemoveCachedToken() error {
 	return uotm.credCache.RemoveCachedToken()
 }
 
-//====================================================================================
+// ====================================================================================
 
 // EnvVarOAuthTokenInfo passes oauth token info into AzCopy through environment variable.
 // Note: this is only used for testing, and not encouraged to be used in production environments.
@@ -577,7 +387,7 @@ func (uotm *UserOAuthTokenManager) getTokenInfoFromEnvVar(ctx context.Context) (
 	}
 
 	// Remove the env var after successfully fetching once,
-	// in case of env var is further spreading into child processes unexpectly.
+	// in case of env var is further spreading into child processes unexpectedly.
 	lcm.ClearEnvironmentVariable(EEnvironmentVariable.OAuthTokenInfo())
 
 	tokenInfo, err := jsonToTokenInfo([]byte(rawToken))
@@ -596,7 +406,7 @@ func (uotm *UserOAuthTokenManager) getTokenInfoFromEnvVar(ctx context.Context) (
 	return tokenInfo, nil
 }
 
-//====================================================================================
+// ====================================================================================
 
 // TokenRefreshSourceTokenStore indicates enabling azcopy oauth integration through tokenstore.
 // Note: This should be only used for internal integrations.
@@ -604,6 +414,7 @@ const TokenRefreshSourceTokenStore = "tokenstore"
 
 // OAuthTokenInfo contains info necessary for refresh OAuth credentials.
 type OAuthTokenInfo struct {
+	azcore.TokenCredential `json:"-"`
 	adal.Token
 	Tenant                  string `json:"_tenant"`
 	ActiveDirectoryEndpoint string `json:"_ad_endpoint"`
@@ -613,6 +424,8 @@ type OAuthTokenInfo struct {
 	IdentityInfo            IdentityInfo
 	ServicePrincipalName    bool `json:"_spn"`
 	SPNInfo                 SPNInfo
+	AzCLICred               bool
+	PSCred					bool
 	// Note: ClientID should be only used for internal integrations through env var with refresh token.
 	// It indicates the Application ID assigned to your app when you registered it with Azure AD.
 	// In this case AzCopy refresh token on behalf of caller.
@@ -657,26 +470,29 @@ func (identityInfo *IdentityInfo) Validate() error {
 
 // Refresh gets new token with token info.
 func (credInfo *OAuthTokenInfo) Refresh(ctx context.Context) (*adal.Token, error) {
-	if credInfo.TokenRefreshSource == TokenRefreshSourceTokenStore {
-		return credInfo.GetNewTokenFromTokenStore(ctx)
+	// TODO: I think this method is only necessary until datalake is migrated.
+	// Returns cached TokenCredential or creates a new one if it hasn't been created yet.
+	tc, err := credInfo.GetTokenCredential()
+	if err != nil {
+		return nil, err
 	}
-
-	if credInfo.Identity {
-		return credInfo.GetNewTokenFromMSI(ctx)
-	}
-
-	if credInfo.ServicePrincipalName {
-		if credInfo.SPNInfo.CertPath != "" {
-			return credInfo.GetNewTokenFromCert(ctx)
-		} else {
-			return credInfo.GetNewTokenFromSecret(ctx)
+	if credInfo.TokenRefreshSource == "tokenstore" || credInfo.Identity || credInfo.ServicePrincipalName {
+		scopes := []string{StorageScope}
+		t, err := tc.GetToken(ctx, policy.TokenRequestOptions{Scopes: scopes})
+		if err != nil {
+			return nil, err
+		}
+		return &adal.Token{
+			AccessToken: t.Token,
+			ExpiresOn:   json.Number(strconv.FormatInt(int64(t.ExpiresOn.Sub(date.UnixEpoch())/time.Second), 10)),
+		}, nil
+	} else {
+		if dcc, ok := tc.(*DeviceCodeCredential); ok {
+			return dcc.RefreshTokenWithUserCredential(ctx, Resource)
 		}
 	}
-
-	return credInfo.RefreshTokenWithUserCredential(ctx)
+	return nil, errors.New("invalid token info")
 }
-
-var msiTokenHTTPClient = newAzcopyHTTPClient()
 
 // Single instance token store credential cache shared by entire azcopy process.
 var tokenStoreCredCache = NewCredCacheInternalIntegration(CredCacheOptions{
@@ -684,232 +500,6 @@ var tokenStoreCredCache = NewCredCacheInternalIntegration(CredCacheOptions{
 	ServiceName: "azcopy",
 	AccountName: "aadtoken/" + strconv.Itoa(os.Getpid()),
 })
-
-// GetNewTokenFromTokenStore gets token from token store. (Credential Manager in Windows, keyring in Linux and keychain in MacOS.)
-// Note: This approach should only be used in internal integrations.
-func (credInfo *OAuthTokenInfo) GetNewTokenFromTokenStore(ctx context.Context) (*adal.Token, error) {
-	hasToken, err := tokenStoreCredCache.HasCachedToken()
-	if err != nil || !hasToken {
-		return nil, fmt.Errorf("no cached token found in Token Store Mode(SE), %v", err)
-	}
-
-	tokenInfo, err := tokenStoreCredCache.LoadToken()
-	if err != nil {
-		return nil, fmt.Errorf("get cached token failed in Token Store Mode(SE), %v", err)
-	}
-
-	return &(tokenInfo.Token), nil
-}
-
-// queryIMDS sends a token request to the IMDS endpoint passed by the caller. This IMDS endpoint will be different for Azure and Arc VMs.
-func (credInfo *OAuthTokenInfo) queryIMDS(ctx context.Context, msiEndpoint string, resource string, imdsAPIVersion string) (*http.Request, *http.Response, error) {
-	// Prepare request to get token from Azure Instance Metadata Service identity endpoint.
-	req, err := http.NewRequest("GET", msiEndpoint, nil)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create request: %v", err)
-	}
-
-	params := req.URL.Query()
-	params.Set("resource", resource)
-	params.Set("api-version", imdsAPIVersion)
-
-	if credInfo.IdentityInfo.ClientID != "" {
-		params.Set("client_id", credInfo.IdentityInfo.ClientID)
-	}
-	if credInfo.IdentityInfo.ObjectID != "" {
-		params.Set("object_id", credInfo.IdentityInfo.ObjectID)
-	}
-	if credInfo.IdentityInfo.MSIResID != "" {
-		params.Set("msi_res_id", credInfo.IdentityInfo.MSIResID)
-	}
-
-	req.URL.RawQuery = params.Encode()
-	req.Header.Set("Metadata", "true")
-
-	// Set context.
-	req.WithContext(ctx)
-	// In case of some other process (Http Server) listening at 127.0.0.1:40342 , we do not want to wait forever for it to serve request
-	msiTokenHTTPClient.Timeout = 10 * time.Second
-	// Send request
-	resp, err := msiTokenHTTPClient.Do(req)
-	// Unset the timeout back
-	msiTokenHTTPClient.Timeout = 0
-	return req, resp, err
-}
-
-// isValidArcResponse checks if the key "Www-Authenticate" is unavailable in the header of an http response
-func isValidArcResponse(resp *http.Response) bool {
-	wwwAuthenticateExists := false
-	if resp != nil && resp.Header != nil {
-		// Parameter for validity is whether "Www-Authenticate" exists in the response header
-		// "Www-Authenticate" contains the path to the challenge token file for Arc VMs
-		_, wwwAuthenticateExists = resp.Header["Www-Authenticate"]
-	}
-
-	return wwwAuthenticateExists
-}
-
-// fixupTokenJson corrects the value of JSON field "not_before" in the Byte slice from blank to a valid value and returns the corrected Byte slice.
-
-// Dated 15th Sep 2021.
-// Token JSON returned by ARC-server endpoint API currently does not set a valid integral value for "not_before" key.
-// If the token JSON already has "not_before" correctly set, this will be a no-op.
-func fixupTokenJson(bytes []byte) []byte {
-	byteSliceToString := string(bytes)
-	separatorString := `"not_before":"`
-	stringSlice := strings.Split(byteSliceToString, separatorString)
-
-	if stringSlice[1][0] != '"' {
-		return bytes
-	}
-
-	// If the value of not_before is blank, set to "now - 5 sec" and return the updated slice
-	notBeforeTimeInteger := uint64(time.Now().Unix() - 5)
-	notBeforeTime := strconv.FormatUint(notBeforeTimeInteger, 10)
-	return []byte(stringSlice[0] + separatorString + notBeforeTime + stringSlice[1])
-}
-
-// GetNewTokenFromMSI gets token from Azure Instance Metadata Service identity endpoint. It first checks if the VM is registered with Azure Arc. Failing that case, it checks if it is an Azure VM.
-// For details, please refer to https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview
-// Note: The msiTokenHTTPClient timeout is has been reduced from 30 sec to 10 sec as IMDS endpoint is local to the machine.
-// Without this change, if some router is configured to not return "ICMP unreachable" then it will take 30 secs to timeout and increase the response time.
-// We are additionally checking Arc first, and then Azure VM because Arc endpoint is local so as to further reduce the response time of the Azure VM IMDS endpoint.
-func (credInfo *OAuthTokenInfo) GetNewTokenFromMSI(ctx context.Context) (*adal.Token, error) {
-	// Try Arc VM
-	req, resp, errArcVM := credInfo.queryIMDS(ctx, MSIEndpointArcVM, Resource, IMDSAPIVersionArcVM)
-	if errArcVM != nil {
-		// Try Azure VM since there was an error in trying Arc VM
-		reqAzureVM, respAzureVM, errAzureVM := credInfo.queryIMDS(ctx, MSIEndpointAzureVM, Resource, IMDSAPIVersionAzureVM)
-		if errAzureVM != nil {
-			var serr syscall.Errno
-			if errors.As(errArcVM, &serr) {
-				econnrefusedValue := -1
-				switch runtime.GOOS {
-				case "linux":
-					econnrefusedValue = int(syscall.ECONNREFUSED)
-				case "windows":
-					econnrefusedValue = WSAECONNREFUSED
-				}
-
-				if int(serr) == econnrefusedValue {
-					// If connection to Arc endpoint was refused
-					return nil, fmt.Errorf("please check whether MSI is enabled on this PC, to enable MSI please refer to https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/qs-configure-portal-windows-vm#enable-system-assigned-identity-on-an-existing-vm: %v", errAzureVM)
-				}
-
-				// A syscall error other than ECONNREFUSED, implies we could not get the HTTP response
-				return nil, fmt.Errorf("error communicating with Arc IMDS endpoint (%s): %v", MSIEndpointArcVM, errArcVM)
-			}
-
-			// queryIMDS failed, but not with a syscall error
-			// 1. Either it is an HTTP error, or
-			// 2. The HTTP request timed out
-			return nil, fmt.Errorf("invalid response received from Arc IMDS endpoint (%s), probably some unknown process listening: %v", MSIEndpointArcVM, errArcVM)
-		}
-
-		// Arc IMDS failed with error, but Azure IMDS succeeded
-		req, resp = reqAzureVM, respAzureVM
-	} else if !isValidArcResponse(resp) {
-		// Not valid response from ARC IMDS endpoint. Perhaps some other process listening on it. Try Azure IMDS endpoint as fallback option.
-		reqAzureVM, respAzureVM, errAzureVM := credInfo.queryIMDS(ctx, MSIEndpointAzureVM, Resource, IMDSAPIVersionAzureVM)
-		if errAzureVM != nil {
-			// Neither Arc nor Azure VM IMDS endpoint available. Can't use MSI.
-			return nil, fmt.Errorf("invalid response received from Arc IMDS endpoint (%s), probably some unknown process listening. If this an Azure VM, please check whether MSI is enabled, to enable MSI please refer to https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/qs-configure-portal-windows-vm#enable-system-assigned-identity-on-an-existing-vm: %v", MSIEndpointArcVM, errAzureVM)
-		}
-
-		// Azure VM IMDS endpoint ok!
-		req, resp = reqAzureVM, respAzureVM
-	} else {
-		// Valid response received from ARC IMDS endpoint. Proceed with the next step.
-		challengeTokenPath := strings.Split(resp.Header["Www-Authenticate"][0], "=")[1]
-		// Open the file.
-		challengeTokenFile, fileErr := os.Open(challengeTokenPath)
-		if os.IsPermission(fileErr) {
-			switch runtime.GOOS {
-			case "linux":
-				return nil, fmt.Errorf("permission level inadequate to read Arc challenge token file %s. Make sure you are running AzCopy as a user who is a member of the \"himds\" group or is superuser.", challengeTokenPath)
-			case "windows":
-				return nil, fmt.Errorf("permission level inadequate to read Arc challenge token file %s. Make sure you are running AzCopy as a user who is a member of the \"local Administrators\" group or the \"Hybrid Agent Extension Applications\" group.", challengeTokenPath)
-			default:
-				return nil, fmt.Errorf("error occurred while opening file %s in unsupported GOOS %s: %v", challengeTokenPath, runtime.GOOS, fileErr)
-			}
-		} else if fileErr != nil {
-			return nil, fmt.Errorf("error occurred while opening file %s: %v", challengeTokenPath, fileErr)
-		}
-
-		defer challengeTokenFile.Close()
-
-		// Create a new Reader for the file.
-		reader := bufio.NewReader(challengeTokenFile)
-		challengeToken, fileErr := reader.ReadString('\n')
-		if fileErr != nil && fileErr != io.EOF {
-			return nil, fmt.Errorf("error occurred while reading file %s: %v", challengeTokenPath, fileErr)
-		}
-
-		req.Header.Set("Authorization", "Basic "+challengeToken)
-
-		resp, errArcVM = msiTokenHTTPClient.Do(req)
-		if errArcVM != nil {
-			return nil, fmt.Errorf("failed to query token from Arc IMDS endpoint: %v", errArcVM)
-		}
-	}
-
-	defer func() { // resp and Body should not be nil
-		io.Copy(ioutil.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	// Check if the status code indicates success
-	// The request returns 200 currently, add 201 and 202 as well for possible extension.
-	if !(HTTPResponseExtension{Response: resp}).IsSuccessStatusCode(http.StatusOK, http.StatusCreated, http.StatusAccepted) {
-		return nil, fmt.Errorf("failed to get token from msi, status code: %v", resp.StatusCode)
-	}
-
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	result := &adal.Token{}
-	if len(b) > 0 {
-		b = ByteSliceExtension{ByteSlice: b}.RemoveBOM()
-		// Unmarshal will give an error for Go version >= 1.14 for a field with blank values. Arc-server endpoint API returns blank for "not_before" field.
-		// TODO: Remove fixup once Arc team fixes the issue.
-		b = fixupTokenJson(b)
-		if err := json.Unmarshal(b, result); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal response body: %v", err)
-		}
-	} else {
-		return nil, errors.New("failed to get token from msi")
-	}
-
-	return result, nil
-}
-
-// RefreshTokenWithUserCredential gets new token with user credential through refresh.
-func (credInfo *OAuthTokenInfo) RefreshTokenWithUserCredential(ctx context.Context) (*adal.Token, error) {
-	oauthConfig, err := adal.NewOAuthConfig(credInfo.ActiveDirectoryEndpoint, credInfo.Tenant)
-	if err != nil {
-		return nil, err
-	}
-
-	// ClientID in credInfo is optional which is used for internal integration only.
-	// Use AzCopy's 1st party applicationID for refresh by default.
-	spt, err := adal.NewServicePrincipalTokenFromManualToken(
-		*oauthConfig,
-		IffString(credInfo.ClientID != "", credInfo.ClientID, ApplicationID),
-		Resource,
-		credInfo.Token)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := spt.RefreshWithContext(ctx); err != nil {
-		return nil, err
-	}
-
-	newToken := spt.Token()
-	return &newToken, nil
-}
 
 // IsEmpty returns if current OAuthTokenInfo is empty and doesn't contain any useful info.
 func (credInfo OAuthTokenInfo) IsEmpty() bool {
@@ -925,16 +515,272 @@ func (credInfo OAuthTokenInfo) toJSON() ([]byte, error) {
 	return json.Marshal(credInfo)
 }
 
+func getAuthorityURL(tenantID, activeDirectoryEndpoint string) (*url.URL, error) {
+	u, err := url.Parse(activeDirectoryEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	return u.Parse(tenantID)
+}
+
+const minimumTokenValidDuration = time.Minute * 5
+type TokenStoreCredential struct {
+	token *azcore.AccessToken
+	lock  sync.RWMutex
+}
+
+// globalTokenStoreCredential is created to make sure that all
+// service clients share same cred object. This is required so that
+// we do not make repeated GetToken calls.
+// This is a temporary fix for issue where we would request a
+// new token from Stg Exp even while they've not yet populated the
+// tokenstore. 
+//
+// This is okay because we use same credential on both source and
+// destination. If we move to a case where the credentials are
+// different, this should be removed.
+//
+// We should move to a method where the token is always read  from
+// tokenstore, and azcopy is invoked after tokenstore is populated.
+//
+var globalTokenStoreCredential *TokenStoreCredential
+var globalTsc sync.Once
+
+func (tsc *TokenStoreCredential) GetToken(_ context.Context, _ policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	// if the token we've has not expired, return the same.
+	tsc.lock.RLock()
+	if time.Until(tsc.token.ExpiresOn) > minimumTokenValidDuration {
+		return *tsc.token, nil
+	}
+	tsc.lock.RUnlock()
+
+	tsc.lock.Lock()
+	defer tsc.lock.Unlock()
+	hasToken, err := tokenStoreCredCache.HasCachedToken()
+	if err != nil || !hasToken {
+		return azcore.AccessToken{}, fmt.Errorf("no cached token found in Token Store Mode(SE), %v", err)
+	}
+
+	tokenInfo, err := tokenStoreCredCache.LoadToken()
+	if err != nil {
+		return azcore.AccessToken{}, fmt.Errorf("get cached token failed in Token Store Mode(SE), %v", err)
+	}
+
+	tsc.token = &azcore.AccessToken{
+		Token:     tokenInfo.AccessToken,
+		ExpiresOn: tokenInfo.Expires(),
+	}
+
+	return *tsc.token, nil
+
+}
+
+// GetNewTokenFromTokenStore gets token from token store. (Credential Manager in Windows, keyring in Linux and keychain in MacOS.)
+// Note: This approach should only be used in internal integrations.
+func GetTokenStoreCredential(accessToken string, expiresOn time.Time) (azcore.TokenCredential) {
+	globalTsc.Do(func() {
+		globalTokenStoreCredential = &TokenStoreCredential{
+			token: &azcore.AccessToken{
+				Token:     accessToken,
+				ExpiresOn: expiresOn,
+			},
+		}
+	})
+	return globalTokenStoreCredential
+}
+
+func (credInfo *OAuthTokenInfo) GetTokenStoreCredential() (azcore.TokenCredential, error) {
+	credInfo.TokenCredential = GetTokenStoreCredential(credInfo.AccessToken, credInfo.Expires())
+	return credInfo.TokenCredential, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetManagedIdentityCredential() (azcore.TokenCredential, error) {
+	var id azidentity.ManagedIDKind
+	if credInfo.IdentityInfo.ClientID != "" {
+		id = azidentity.ClientID(credInfo.IdentityInfo.ClientID)
+	} else if credInfo.IdentityInfo.MSIResID != "" {
+		id = azidentity.ResourceID(credInfo.IdentityInfo.MSIResID)
+	} else if credInfo.IdentityInfo.ObjectID != "" {
+		return nil, fmt.Errorf("object ID is deprecated and no longer supported for managed identity. Please use client ID or resource ID instead")
+	}
+
+	tc, err := azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Transport: newAzcopyHTTPClient(),
+		},
+		ID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetClientCertificateCredential() (azcore.TokenCredential, error) {
+	authorityHost, err := getAuthorityURL(credInfo.Tenant, credInfo.ActiveDirectoryEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	certData, err := os.ReadFile(credInfo.SPNInfo.CertPath)
+	if err != nil {
+		return nil, err
+	}
+	certs, key, err := azidentity.ParseCertificates(certData, []byte(credInfo.SPNInfo.Secret))
+	if err != nil {
+		return nil, err
+	}
+	tc, err := azidentity.NewClientCertificateCredential(credInfo.Tenant, credInfo.ApplicationID, certs, key, &azidentity.ClientCertificateCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud:     cloud.Configuration{ActiveDirectoryAuthorityHost: authorityHost.String()},
+			Transport: newAzcopyHTTPClient(),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetClientSecretCredential() (azcore.TokenCredential, error) {
+	authorityHost, err := getAuthorityURL(credInfo.Tenant, credInfo.ActiveDirectoryEndpoint)
+	if err != nil {
+		return nil, err
+	}
+	tc, err := azidentity.NewClientSecretCredential(credInfo.Tenant, credInfo.ApplicationID, credInfo.SPNInfo.Secret, &azidentity.ClientSecretCredentialOptions{
+		ClientOptions: azcore.ClientOptions{
+			Cloud:     cloud.Configuration{ActiveDirectoryAuthorityHost: authorityHost.String()},
+			Transport: newAzcopyHTTPClient(),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetAzCliCredential() (azcore.TokenCredential, error) {
+	tc, err := azidentity.NewAzureCLICredential(&azidentity.AzureCLICredentialOptions{TenantID: credInfo.Tenant})
+	if err != nil {
+		return nil, err
+	}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetPSContextCredential() (azcore.TokenCredential, error) {
+	tc, err := NewPowershellContextCredential(nil)
+	if err != nil {
+		return nil, err
+	}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+type DeviceCodeCredential struct {
+	token       adal.Token
+	aadEndpoint string
+	tenantID    string
+	clientID    string
+}
+
+func (dcc *DeviceCodeCredential) GetToken(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
+	waitDuration := dcc.token.Expires().Sub(time.Now().UTC()) / 2
+	if dcc.token.WillExpireIn(waitDuration) {
+		resource := strings.TrimSuffix(options.Scopes[0], "/.default")
+		_, err := dcc.RefreshTokenWithUserCredential(ctx, resource)
+		if err != nil {
+			return azcore.AccessToken{}, err
+		}
+	}
+	return azcore.AccessToken{Token: dcc.token.AccessToken, ExpiresOn: dcc.token.Expires()}, nil
+}
+
+// RefreshTokenWithUserCredential gets new token with user credential through refresh.
+func (dcc *DeviceCodeCredential) RefreshTokenWithUserCredential(ctx context.Context, resource string) (*adal.Token, error) {
+	targetResource := resource
+	if dcc.token.Resource != "" && dcc.token.Resource != targetResource {
+		targetResource = dcc.token.Resource
+	}
+
+	oauthConfig, err := adal.NewOAuthConfig(dcc.aadEndpoint, dcc.tenantID)
+	if err != nil {
+		return nil, err
+	}
+
+	// ClientID in credInfo is optional which is used for internal integration only.
+	// Use AzCopy's 1st party applicationID for refresh by default.
+	spt, err := adal.NewServicePrincipalTokenFromManualToken(
+		*oauthConfig,
+		Iff(dcc.clientID != "", dcc.clientID, ApplicationID),
+		targetResource,
+		dcc.token)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := spt.RefreshWithContext(ctx); err != nil {
+		return nil, err
+	}
+
+	newToken := spt.Token()
+	dcc.token = newToken
+	return &newToken, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetDeviceCodeCredential() (azcore.TokenCredential, error) {
+	tc := &DeviceCodeCredential{token: credInfo.Token, aadEndpoint: credInfo.ActiveDirectoryEndpoint, tenantID: credInfo.Tenant, clientID: credInfo.ApplicationID}
+	credInfo.TokenCredential = tc
+	return tc, nil
+}
+
+func (credInfo *OAuthTokenInfo) GetTokenCredential() (azcore.TokenCredential, error) {
+	// Token Credential is cached.
+	if credInfo.TokenCredential != nil {
+		return credInfo.TokenCredential, nil
+	}
+
+	if credInfo.TokenRefreshSource == TokenRefreshSourceTokenStore {
+		return credInfo.GetTokenStoreCredential()
+	}
+
+	if credInfo.Identity {
+		return credInfo.GetManagedIdentityCredential()
+	}
+
+	if credInfo.ServicePrincipalName {
+		if credInfo.SPNInfo.CertPath != "" {
+			return credInfo.GetClientCertificateCredential()
+		} else {
+			return credInfo.GetClientSecretCredential()
+		}
+	}
+
+	if credInfo.AzCLICred {
+		return credInfo.GetAzCliCredential()
+	}
+
+	if credInfo.PSCred {
+		return credInfo.GetPSContextCredential()
+	}
+	return credInfo.GetDeviceCodeCredential()
+}
+
 // jsonToTokenInfo converts bytes to OAuthTokenInfo
 func jsonToTokenInfo(b []byte) (*OAuthTokenInfo, error) {
 	var OAuthTokenInfo OAuthTokenInfo
 	if err := json.Unmarshal(b, &OAuthTokenInfo); err != nil {
 		return nil, err
 	}
+	if OAuthTokenInfo.TokenRefreshSource == TokenRefreshSourceTokenStore {
+		_, _ = OAuthTokenInfo.GetTokenStoreCredential()
+	}
 	return &OAuthTokenInfo, nil
 }
 
-//====================================================================================
+// ====================================================================================
 
 // TestOAuthInjection controls variables for OAuth testing injections
 type TestOAuthInjection struct {

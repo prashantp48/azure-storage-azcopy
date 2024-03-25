@@ -22,17 +22,16 @@ package ste
 
 import (
 	"bytes"
-	"context"
-	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
-type pipelineNetworkStats struct {
+type PipelineNetworkStats struct {
 	atomicOperationCount       int64
 	atomicNetworkErrorCount    int64
 	atomic503CountThroughput   int64
@@ -44,8 +43,8 @@ type pipelineNetworkStats struct {
 	tunerInterface             ConcurrencyTuner
 }
 
-func newPipelineNetworkStats(tunerInterface ConcurrencyTuner) *pipelineNetworkStats {
-	s := &pipelineNetworkStats{tunerInterface: tunerInterface}
+func newPipelineNetworkStats(tunerInterface ConcurrencyTuner) *PipelineNetworkStats {
+	s := &PipelineNetworkStats{tunerInterface: tunerInterface}
 	tunerWillCallUs := tunerInterface.RequestCallbackWhenStable(s.start) // we want to start gather stats after the tuner has reached a stable value. No point in gathering them earlier
 	if !tunerWillCallUs {
 		// assume tuner is inactive, and start ourselves now
@@ -55,19 +54,19 @@ func newPipelineNetworkStats(tunerInterface ConcurrencyTuner) *pipelineNetworkSt
 }
 
 // start starts the gathering of stats
-func (s *pipelineNetworkStats) start() {
+func (s *PipelineNetworkStats) start() {
 	atomic.StoreInt64(&s.atomicStartSeconds, time.Now().Unix())
 }
 
-func (s *pipelineNetworkStats) getStartSeconds() int64 {
+func (s *PipelineNetworkStats) getStartSeconds() int64 {
 	return atomic.LoadInt64(&s.atomicStartSeconds)
 }
 
-func (s *pipelineNetworkStats) IsStarted() bool {
+func (s *PipelineNetworkStats) IsStarted() bool {
 	return s.getStartSeconds() > 0
 }
 
-func (s *pipelineNetworkStats) recordRetry(responseBody string) {
+func (s *PipelineNetworkStats) recordRetry(responseBody string) {
 	if strings.Contains(responseBody, "gress is over the account limit") { // maybe Ingress or Egress
 		atomic.AddInt64(&s.atomic503CountThroughput, 1)
 	} else if strings.Contains(responseBody, "Operations per second is over the account limit") {
@@ -77,7 +76,7 @@ func (s *pipelineNetworkStats) recordRetry(responseBody string) {
 	}
 }
 
-func (s *pipelineNetworkStats) OperationsPerSecond() int {
+func (s *PipelineNetworkStats) OperationsPerSecond() int {
 	s.nocopy.Check()
 	if !s.IsStarted() {
 		return 0
@@ -90,7 +89,7 @@ func (s *pipelineNetworkStats) OperationsPerSecond() int {
 	}
 }
 
-func (s *pipelineNetworkStats) NetworkErrorPercentage() float32 {
+func (s *PipelineNetworkStats) NetworkErrorPercentage() float32 {
 	s.nocopy.Check()
 	ops := float32(atomic.LoadInt64(&s.atomicOperationCount))
 	if ops > 0 {
@@ -100,7 +99,7 @@ func (s *pipelineNetworkStats) NetworkErrorPercentage() float32 {
 	}
 }
 
-func (s *pipelineNetworkStats) TotalServerBusyPercentage() float32 {
+func (s *PipelineNetworkStats) TotalServerBusyPercentage() float32 {
 	s.nocopy.Check()
 	ops := float32(atomic.LoadInt64(&s.atomicOperationCount))
 	if ops > 0 {
@@ -112,14 +111,14 @@ func (s *pipelineNetworkStats) TotalServerBusyPercentage() float32 {
 	}
 }
 
-func (s *pipelineNetworkStats) GetTotalRetries() int64 {
+func (s *PipelineNetworkStats) GetTotalRetries() int64 {
 	s.nocopy.Check()
 	return atomic.LoadInt64(&s.atomic503CountThroughput) +
 		atomic.LoadInt64(&s.atomic503CountIOPS) +
 		atomic.LoadInt64(&s.atomic503CountUnknown)
 }
 
-func (s *pipelineNetworkStats) IOPSServerBusyPercentage() float32 {
+func (s *PipelineNetworkStats) IOPSServerBusyPercentage() float32 {
 	s.nocopy.Check()
 	ops := float32(atomic.LoadInt64(&s.atomicOperationCount))
 	if ops > 0 {
@@ -129,7 +128,7 @@ func (s *pipelineNetworkStats) IOPSServerBusyPercentage() float32 {
 	}
 }
 
-func (s *pipelineNetworkStats) ThroughputServerBusyPercentage() float32 {
+func (s *PipelineNetworkStats) ThroughputServerBusyPercentage() float32 {
 	s.nocopy.Check()
 	ops := float32(atomic.LoadInt64(&s.atomicOperationCount))
 	if ops > 0 {
@@ -139,7 +138,7 @@ func (s *pipelineNetworkStats) ThroughputServerBusyPercentage() float32 {
 	}
 }
 
-func (s *pipelineNetworkStats) OtherServerBusyPercentage() float32 {
+func (s *PipelineNetworkStats) OtherServerBusyPercentage() float32 {
 	s.nocopy.Check()
 	ops := float32(atomic.LoadInt64(&s.atomicOperationCount))
 	if ops > 0 {
@@ -149,7 +148,7 @@ func (s *pipelineNetworkStats) OtherServerBusyPercentage() float32 {
 	}
 }
 
-func (s *pipelineNetworkStats) AverageE2EMilliseconds() int {
+func (s *PipelineNetworkStats) AverageE2EMilliseconds() int {
 	s.nocopy.Check()
 	ops := atomic.LoadInt64(&s.atomicOperationCount)
 	if ops > 0 {
@@ -157,45 +156,6 @@ func (s *pipelineNetworkStats) AverageE2EMilliseconds() int {
 	} else {
 		return 0
 	}
-}
-
-type xferStatsPolicy struct {
-	next  pipeline.Policy
-	stats *pipelineNetworkStats
-}
-
-// Do accumulates stats for each call
-func (p *xferStatsPolicy) Do(ctx context.Context, request pipeline.Request) (pipeline.Response, error) {
-	start := time.Now()
-
-	resp, err := p.next.Do(ctx, request)
-
-	if p.stats != nil {
-		if p.stats.IsStarted() {
-			atomic.AddInt64(&p.stats.atomicOperationCount, 1)
-			atomic.AddInt64(&p.stats.atomicE2ETotalMilliseconds, int64(time.Since(start).Seconds()*1000))
-
-			if err != nil && !isContextCancelledError(err) {
-				// no response from server
-				atomic.AddInt64(&p.stats.atomicNetworkErrorCount, 1)
-			}
-		}
-
-		// always look at retries, even if not started, because concurrency tuner needs to know about them
-		if resp != nil {
-			// TODO should we also count status 500?  It is mentioned here as timeout:https://docs.microsoft.com/en-us/azure/storage/common/storage-scalability-targets
-			if rr := resp.Response(); rr != nil && rr.StatusCode == http.StatusServiceUnavailable {
-				p.stats.tunerInterface.recordRetry() // always tell the tuner
-				if p.stats.IsStarted() {             // but only count it here, if we have started
-					// To find out why the server was busy we need to look at the response
-					responseBodyText := transparentlyReadBody(rr)
-					p.stats.recordRetry(responseBodyText)
-				}
-			}
-		}
-	}
-
-	return resp, err
 }
 
 // transparentlyReadBody reads the response body, and then (because body is read-once-only) replaces it with
@@ -206,16 +166,48 @@ func transparentlyReadBody(r *http.Response) string {
 	if r.Body == http.NoBody {
 		return ""
 	}
-	buf, _ := ioutil.ReadAll(r.Body)                // error responses are short fragments of XML, so safe to read all
-	_ = r.Body.Close()                              // must close the real body
-	r.Body = ioutil.NopCloser(bytes.NewReader(buf)) // replace it with something that will read the same data we just read
+	buf, _ := io.ReadAll(r.Body)                // error responses are short fragments of XML, so safe to read all
+	_ = r.Body.Close()                          // must close the real body
+	r.Body = io.NopCloser(bytes.NewReader(buf)) // replace it with something that will read the same data we just read
 
 	return string(buf) // copy to string
 }
 
-func newXferStatsPolicyFactory(accumulator *pipelineNetworkStats) pipeline.Factory {
-	return pipeline.FactoryFunc(func(next pipeline.Policy, po *pipeline.PolicyOptions) pipeline.PolicyFunc {
-		r := xferStatsPolicy{next: next, stats: accumulator}
-		return r.Do
-	})
+type statsPolicy struct {
+	stats *PipelineNetworkStats
+}
+
+func (s statsPolicy) Do(req *policy.Request) (*http.Response, error) {
+	start := time.Now()
+
+	response, err := req.Next()
+	if s.stats != nil {
+		if s.stats.IsStarted() {
+			atomic.AddInt64(&s.stats.atomicOperationCount, 1)
+			atomic.AddInt64(&s.stats.atomicE2ETotalMilliseconds, int64(time.Since(start).Seconds()*1000))
+
+			if err != nil && !isContextCancelledError(err) {
+				// no response from server
+				atomic.AddInt64(&s.stats.atomicNetworkErrorCount, 1)
+			}
+		}
+
+		// always look at retries, even if not started, because concurrency tuner needs to know about them
+		// TODO should we also count status 500?  It is mentioned here as timeout:https://docs.microsoft.com/en-us/azure/storage/common/storage-scalability-targets
+		if response != nil && response.StatusCode == http.StatusServiceUnavailable {
+			s.stats.tunerInterface.recordRetry() // always tell the tuner
+			if s.stats.IsStarted() {             // but only count it here, if we have started
+				// To find out why the server was busy we need to look at the response
+				responseBodyText := transparentlyReadBody(response)
+				s.stats.recordRetry(responseBodyText)
+			}
+
+		}
+	}
+
+	return response, err
+}
+
+func newStatsPolicy(accumulator *PipelineNetworkStats) policy.Policy {
+	return statsPolicy{stats: accumulator}
 }
