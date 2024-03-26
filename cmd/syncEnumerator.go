@@ -129,9 +129,9 @@ func (cca *cookedSyncCmdArgs) initEnumerator(ctx context.Context) (enumerator *s
 
 	// decide our folder transfer strategy
 	fpo, folderMessage := NewFolderPropertyOption(cca.fromTo, cca.recursive, true, filters, cca.preserveSMBInfo, cca.preservePermissions.IsTruthy(), false, strings.EqualFold(cca.destination.Value, common.Dev_Null), false) // sync always acts like stripTopDir=true
-	if !cca.dryrunMode {
-		glcm.Info(folderMessage)
-	}
+	// if !cca.dryrunMode {
+	// 	glcm.Info(folderMessage)
+	// }
 	if jobsAdmin.JobsAdmin != nil {
 		jobsAdmin.JobsAdmin.LogToJobLog(folderMessage, common.LogInfo)
 	}
@@ -177,10 +177,9 @@ func (cca *cookedSyncCmdArgs) initEnumerator(ctx context.Context) (enumerator *s
 		},
 	}
 
-
 	options := createClientOptions(common.AzcopyCurrentJobLogger, nil)
-	
-	// Create Source Client. 
+
+	// Create Source Client.
 	var azureFileSpecificOptions any
 	if cca.fromTo.From() == common.ELocation.File() {
 		azureFileSpecificOptions = &common.FileClientOptions{
@@ -213,7 +212,7 @@ func (cca *cookedSyncCmdArgs) initEnumerator(ctx context.Context) (enumerator *s
 	if cca.fromTo.IsS2S() && srcCredInfo.CredentialType.IsAzureOAuth() {
 		srcTokenCred = common.NewScopedCredential(srcCredInfo.OAuthTokenInfo.TokenCredential, srcCredInfo.CredentialType)
 	}
-	
+
 	options = createClientOptions(common.AzcopyCurrentJobLogger, srcTokenCred)
 	dstURL, _ := cca.destination.String()
 	copyJobTemplate.DstServiceClient, err = common.GetServiceClientForLocation(

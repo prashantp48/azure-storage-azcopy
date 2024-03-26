@@ -111,10 +111,10 @@ func GetStandardInitOutputBuilder(jobID string, logFileLocation string, isCleanu
 			cleanupHeader := "(" + cleanupMessage + " with cleanup jobID " + jobID
 			sb.WriteString(strings.Repeat("-", len(cleanupHeader)) + "\n")
 			sb.WriteString(cleanupHeader)
-		} else {
-			sb.WriteString("\nJob " + jobID + " has started\n")
-			sb.WriteString("Log file is located at: " + logFileLocation)
-			sb.WriteString("\n")
+			// } else {
+			// 	sb.WriteString("\nJob " + jobID + " has started\n")
+			// 	sb.WriteString("Log file is located at: " + logFileLocation)
+			// 	sb.WriteString("\n")
 		}
 		return sb.String()
 	}

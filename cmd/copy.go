@@ -1806,42 +1806,43 @@ func (cca *CookedCopyCmdArgs) ReportProgressOrExit(lcm common.LifecycleMgr) (tot
 				common.PanicIfErr(err)
 				return string(jsonOutput)
 			} else {
-				screenStats, logStats := formatExtraStats(cca.FromTo, summary.AverageIOPS, summary.AverageE2EMilliseconds, summary.NetworkErrorPercentage, summary.ServerBusyPercentage)
+				_, logStats := formatExtraStats(cca.FromTo, summary.AverageIOPS, summary.AverageE2EMilliseconds, summary.NetworkErrorPercentage, summary.ServerBusyPercentage)
 
-				output := fmt.Sprintf(
-					`
+				output := fmt.Sprintf("Total time taken to upload(min) :%v", jobsAdmin.ToFixed(duration.Minutes(), 4))
+				// 				output := fmt.Sprintf(
+				// 					`
 
-Job %s summary
-Elapsed Time (Minutes): %v
-Number of File Transfers: %v
-Number of Folder Property Transfers: %v
-Number of Symlink Transfers: %v
-Total Number of Transfers: %v
-Number of File Transfers Completed: %v
-Number of Folder Transfers Completed: %v
-Number of File Transfers Failed: %v
-Number of Folder Transfers Failed: %v
-Number of File Transfers Skipped: %v
-Number of Folder Transfers Skipped: %v
-TotalBytesTransferred: %v
-Final Job Status: %v%s%s
-`,
-					summary.JobID.String(),
-					jobsAdmin.ToFixed(duration.Minutes(), 4),
-					summary.FileTransfers,
-					summary.FolderPropertyTransfers,
-					summary.SymlinkTransfers,
-					summary.TotalTransfers,
-					summary.TransfersCompleted-summary.FoldersCompleted,
-					summary.FoldersCompleted,
-					summary.TransfersFailed-summary.FoldersFailed,
-					summary.FoldersFailed,
-					summary.TransfersSkipped-summary.FoldersSkipped,
-					summary.FoldersSkipped,
-					summary.TotalBytesTransferred,
-					summary.JobStatus,
-					screenStats,
-					formatPerfAdvice(summary.PerformanceAdvice))
+				// Job %s summary
+				// Elapsed Time (Minutes): %v
+				// Number of File Transfers: %v
+				// Number of Folder Property Transfers: %v
+				// Number of Symlink Transfers: %v
+				// Total Number of Transfers: %v
+				// Number of File Transfers Completed: %v
+				// Number of Folder Transfers Completed: %v
+				// Number of File Transfers Failed: %v
+				// Number of Folder Transfers Failed: %v
+				// Number of File Transfers Skipped: %v
+				// Number of Folder Transfers Skipped: %v
+				// TotalBytesTransferred: %v
+				// Final Job Status: %v%s%s
+				// `,
+				// 					summary.JobID.String(),
+				// 					jobsAdmin.ToFixed(duration.Minutes(), 4),
+				// 					summary.FileTransfers,
+				// 					summary.FolderPropertyTransfers,
+				// 					summary.SymlinkTransfers,
+				// 					summary.TotalTransfers,
+				// 					summary.TransfersCompleted-summary.FoldersCompleted,
+				// 					summary.FoldersCompleted,
+				// 					summary.TransfersFailed-summary.FoldersFailed,
+				// 					summary.FoldersFailed,
+				// 					summary.TransfersSkipped-summary.FoldersSkipped,
+				// 					summary.FoldersSkipped,
+				// 					summary.TotalBytesTransferred,
+				// 					summary.JobStatus,
+				// 					screenStats,
+				// 					formatPerfAdvice(summary.PerformanceAdvice))
 
 				// abbreviated output for cleanup jobs
 				if cca.isCleanupJob {
@@ -2008,7 +2009,7 @@ func init() {
 				glcm.Error("failed to parse user input due to error: " + err.Error())
 			}
 
-			glcm.Info("Scanning...")
+			// glcm.Info("Scanning...")
 
 			cooked.commandString = copyHandlerUtil{}.ConstructCommandStringFromArgs()
 			err = cooked.process()

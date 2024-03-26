@@ -117,27 +117,28 @@ func (cca *resumeJobController) ReportProgressOrExit(lcm common.LifecycleMgr) (t
 		} else {
 			// if json is not needed, then we generate a message that goes nicely on the same line
 			// display a scanning keyword if the job is not completely ordered
-			var scanningString = " (scanning...)"
-			if summary.CompleteJobOrdered {
-				scanningString = ""
-			}
+			// var scanningString = " (scanning...)"
+			// if summary.CompleteJobOrdered {
+			// 	scanningString = ""
+			// }
 
 			throughput := computeThroughput()
-			throughputString := fmt.Sprintf("2-sec Throughput (Mb/s): %v", jobsAdmin.ToFixed(throughput, 4))
-			if throughput == 0 {
-				// As there would be case when no bits sent from local, e.g. service side copy, when throughput = 0, hide it.
-				throughputString = ""
-			}
+			// throughputString := fmt.Sprintf("2-sec Throughput (Mb/s): %v", jobsAdmin.ToFixed(throughput, 4))
+			// if throughput == 0 {
+			// 	// As there would be case when no bits sent from local, e.g. service side copy, when throughput = 0, hide it.
+			// 	throughputString = ""
+			// }
 
 			// indicate whether constrained by disk or not
-			perfString, diskString := getPerfDisplayText(summary.PerfStrings, summary.PerfConstraint, duration, false)
+			_, _ = getPerfDisplayText(summary.PerfStrings, summary.PerfConstraint, duration, false)
 
-			return fmt.Sprintf("%.1f %%, %v Done, %v Failed, %v Pending, %v Skipped, %v Total%s, %s%s%s",
-				summary.PercentComplete,
-				summary.TransfersCompleted,
-				summary.TransfersFailed,
-				summary.TotalTransfers-(summary.TransfersCompleted+summary.TransfersFailed+summary.TransfersSkipped),
-				summary.TransfersSkipped, summary.TotalTransfers, scanningString, perfString, throughputString, diskString)
+			// return fmt.Sprintf("%.1f %%, %v Done, %v Failed, %v Pending, %v Skipped, %v Total%s, %s%s%s",
+			// 	summary.PercentComplete,
+			// 	summary.TransfersCompleted,
+			// 	summary.TransfersFailed,
+			// 	summary.TotalTransfers-(summary.TransfersCompleted+summary.TransfersFailed+summary.TransfersSkipped),
+			// 	summary.TransfersSkipped, summary.TotalTransfers, scanningString, perfString, throughputString, diskString)
+			return fmt.Sprintf("Throughput (Mb/s): %v", jobsAdmin.ToFixed(throughput, 4))
 		}
 	})
 

@@ -231,9 +231,9 @@ func (cca *CookedCopyCmdArgs) initEnumerator(jobPartOrder common.CopyJobPartOrde
 	// decide our folder transfer strategy
 	var message string
 	jobPartOrder.Fpo, message = NewFolderPropertyOption(cca.FromTo, cca.Recursive, cca.StripTopDir, filters, cca.preserveSMBInfo, cca.preservePermissions.IsTruthy(), cca.preservePOSIXProperties, strings.EqualFold(cca.Destination.Value, common.Dev_Null), cca.IncludeDirectoryStubs)
-	if !cca.dryrunMode {
-		glcm.Info(message)
-	}
+	// if !cca.dryrunMode {
+	// 	glcm.Info(message)
+	// }
 	if jobsAdmin.JobsAdmin != nil {
 		jobsAdmin.JobsAdmin.LogToJobLog(message, common.LogInfo)
 	}
