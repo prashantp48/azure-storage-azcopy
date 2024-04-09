@@ -21,6 +21,7 @@
 package e2etest
 
 import (
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"testing"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
@@ -30,23 +31,22 @@ import (
 //   and those specified on the command line
 
 func TestProperties_NameValueMetadataIsPreservedS2S(t *testing.T) {
-	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.AllS2S(), eValidate.Auto(), params{
+	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.AllS2S(), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive: true,
 	}, nil, testFiles{
 		defaultSize: "1K",
 		shouldTransfer: []interface{}{
-			f("filea", with{nameValueMetadata: map[string]string{"foo": "abc", "bar": "def"}}),
-			folder("fold1", with{nameValueMetadata: map[string]string{"other": "xyz"}}),
+			f("filea", with{nameValueMetadata: map[string]*string{"foo": to.Ptr("abc"), "bar": to.Ptr("def")}}),
+			folder("fold1", with{nameValueMetadata: map[string]*string{"other": to.Ptr("xyz")}}),
 		},
 	}, EAccountType.Standard(), EAccountType.Standard(), "")
 }
 
 func TestProperties_NameValueMetadataCanBeUploaded(t *testing.T) {
-	expectedMap := map[string]string{"foo": "abc", "bar": "def"}
-
-	RunScenarios(t, eOperation.Copy(), eTestFromTo.AllUploads(), eValidate.Auto(), params{
+	expectedMap := map[string]*string{"foo": to.Ptr("abc"), "bar": to.Ptr("def"), "baz": to.Ptr("state=a;b")}
+	RunScenarios(t, eOperation.Copy(), eTestFromTo.AllUploads(), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive: true,
-		metadata:  "foo=abc;bar=def",
+		metadata:  "foo=abc;bar=def;baz=state=a\\;b",
 	}, nil, testFiles{
 		defaultSize: "1K",
 		shouldTransfer: []interface{}{
@@ -57,13 +57,13 @@ func TestProperties_NameValueMetadataCanBeUploaded(t *testing.T) {
 }
 
 func TestProperties_HNSACLs(t *testing.T) {
-	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.BlobBlob()), eValidate.Auto(), params{
+	RunScenarios(t, eOperation.CopyAndSync(), eTestFromTo.Other(common.EFromTo.BlobBlob()), eValidate.Auto(), anonymousAuthOnly, anonymousAuthOnly, params{
 		recursive:              true,
 		preserveSMBPermissions: true, // this flag is deprecated, but still held over to avoid breaking.
 	}, nil, testFiles{
 		defaultSize: "1K",
 		shouldTransfer: []interface{}{
-			folder(""),
+			folder("", with{adlsPermissionsACL: "user::rwx,group::rw-,other::r--"}),
 			f("filea", with{adlsPermissionsACL: "user::rwx,group::rwx,other::r--"}),
 			folder("a", with{adlsPermissionsACL: "user::rwx,group::rwx,other::-w-"}),
 			f("a/fileb", with{adlsPermissionsACL: "user::rwx,group::rwx,other::--x"}),

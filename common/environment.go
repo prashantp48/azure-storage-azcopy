@@ -70,6 +70,7 @@ var VisibleEnvironmentVariables = []EnvironmentVariable{
 	EEnvironmentVariable.CPKEncryptionKeySHA256(),
 	EEnvironmentVariable.DisableSyslog(),
 	EEnvironmentVariable.MimeMapping(),
+	EEnvironmentVariable.DownloadToTempPath(),
 }
 
 var EEnvironmentVariable = EnvironmentVariable{}
@@ -77,14 +78,14 @@ var EEnvironmentVariable = EnvironmentVariable{}
 func (EnvironmentVariable) UserDir() EnvironmentVariable {
 	// Only used internally, not listed in the environment variables.
 	return EnvironmentVariable{
-		Name: IffString(runtime.GOOS == "windows", "USERPROFILE", "HOME"),
+		Name: Iff(runtime.GOOS == "windows", "USERPROFILE", "HOME"),
 	}
 }
 
 func (EnvironmentVariable) AutoLoginType() EnvironmentVariable {
 	return EnvironmentVariable{
 		Name:        "AZCOPY_AUTO_LOGIN_TYPE",
-		Description: "Specify the credential type to access Azure Resource without invoking the login command and using the OS secret store, available values SPN, MSI and DEVICE - sequentially for Service Principal, Managed Service Identity and Device workflow.",
+		Description: "Specify the credential type to access Azure Resource without invoking the login command and using the OS secret store, available values SPN, MSI, DEVICE, AZCLI, and PSCRED  - sequentially for Service Principal, Managed Service Identity, Device workflow, Azure CLI, or Azure PowerShell.",
 	}
 }
 
@@ -144,7 +145,7 @@ func (EnvironmentVariable) ManagedIdentityClientID() EnvironmentVariable {
 func (EnvironmentVariable) ManagedIdentityObjectID() EnvironmentVariable {
 	return EnvironmentVariable{
 		Name:        "AZCOPY_MSI_OBJECT_ID",
-		Description: "Object ID for user-assigned identity. This variable is only used for auto login, please use the command line flag instead when invoking the login command.",
+		Description: "Object ID for user-assigned identity. This parameter is deprecated. Please use client id or resource id.",
 	}
 }
 
@@ -318,7 +319,7 @@ func (EnvironmentVariable) CredentialType() EnvironmentVariable {
 func (EnvironmentVariable) DefaultServiceApiVersion() EnvironmentVariable {
 	return EnvironmentVariable{
 		Name:         "AZCOPY_DEFAULT_SERVICE_API_VERSION",
-		DefaultValue: "2020-04-08",
+		DefaultValue: "2023-08-03",
 		Description:  "Overrides the service API version so that AzCopy could accommodate custom environments such as Azure Stack.",
 	}
 }
@@ -359,5 +360,21 @@ func (EnvironmentVariable) MimeMapping() EnvironmentVariable {
 		Name:         "AZCOPY_CONTENT_TYPE_MAP",
 		DefaultValue: "",
 		Description:  "Location of the file to override default OS mime mapping",
+	}
+}
+
+func (EnvironmentVariable) DownloadToTempPath() EnvironmentVariable {
+	return EnvironmentVariable{
+		Name:         "AZCOPY_DOWNLOAD_TO_TEMP_PATH",
+		DefaultValue: "true",
+		Description:  "Configures azcopy to download to a temp path before actual download. Allowed values are true/false",
+	}
+}
+
+func (EnvironmentVariable) DisableBlobTransferResume() EnvironmentVariable {
+	return EnvironmentVariable{
+		Name:         "AZCOPY_DISABLE_INCOMPLETE_BLOB_TRANSFER",
+		DefaultValue: "false",
+		Description:  "An incomplete transfer to blob endpoint will be resumed from start if set to true",
 	}
 }

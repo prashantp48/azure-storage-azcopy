@@ -23,14 +23,17 @@ package e2etest
 import (
 	"encoding/hex"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/Azure/azure-storage-azcopy/v10/cmd"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 ///////////////
@@ -55,8 +58,10 @@ func (h *contentHeaders) DeepCopy() *contentHeaders {
 	ret.contentEncoding = h.contentEncoding
 	ret.contentLanguage = h.contentLanguage
 	ret.contentType = h.contentType
-	ret.contentMD5 = make([]byte, len(h.contentMD5))
-	copy(ret.contentMD5, h.contentMD5)
+	if h.contentMD5 != nil {
+		ret.contentMD5 = make([]byte, len(h.contentMD5))
+		copy(ret.contentMD5, h.contentMD5)
+	}
 
 	return &ret
 }
@@ -84,19 +89,132 @@ func (h *contentHeaders) String() string {
 // This is exposed to the declarativeResourceManagers, to create/check the objects.
 // All field are pointers or interfaces to make them nil-able. Nil means "unspecified".
 type objectProperties struct {
-	isFolder           bool // if false, the object is a file
+	entityType         common.EntityType
+	symlinkTarget      *string
+	posixProperties    *objectUnixStatContainer
 	size               *int64
 	contentHeaders     *contentHeaders
-	nameValueMetadata  map[string]string
+	nameValueMetadata  map[string]*string
 	blobTags           common.BlobTags
 	blobType           common.BlobType
+	blobVersions       *uint
 	creationTime       *time.Time
 	lastWriteTime      *time.Time
 	smbAttributes      *uint32
 	smbPermissionsSddl *string
 	adlsPermissionsACL *string // TODO: Test owner and group; needs a good target though.
-	cpkInfo            *common.CpkInfo
-	cpkScopeInfo       *common.CpkScopeInfo
+	cpkInfo            *blob.CPKInfo
+	cpkScopeInfo       *blob.CPKScopeInfo
+}
+
+type objectUnixStatContainer struct {
+	// mode can contain THE FOLLOWING file type specifier bits (common.S_IFSOCK, common.S_IFIFO)
+	// common.S_IFDIR and common.S_IFLNK are achievable using folder() and symlink().
+	// TODO/Spike: common.S_IFBLK and common.S_IFCHR may be difficult to replicate consistently in a test environment
+	mode *uint32
+
+	accessTime *time.Time
+	modTime    *time.Time
+}
+
+func (o *objectUnixStatContainer) HasTimes() bool {
+	return o != nil && (o.accessTime != nil || o.modTime != nil)
+}
+
+func (o *objectUnixStatContainer) Empty() bool {
+	if o == nil {
+		return true
+	}
+
+	return o.mode == nil &&
+		o.accessTime == nil &&
+		o.modTime == nil
+}
+
+func (o *objectUnixStatContainer) DeepCopy() *objectUnixStatContainer {
+	if o == nil {
+		return nil
+	}
+	out := &objectUnixStatContainer{}
+
+	if o.mode != nil {
+		mode := *o.mode
+		out.mode = &mode
+	}
+
+	if o.accessTime != nil {
+		accessTime := *o.accessTime
+		out.accessTime = &accessTime
+	}
+
+	if o.modTime != nil {
+		modTime := *o.modTime
+		out.modTime = &modTime
+	}
+
+	return out
+}
+
+func (o *objectUnixStatContainer) EquivalentToStatAdapter(s common.UnixStatAdapter) string {
+	if o == nil {
+		return "" // no comparison to make
+	}
+
+	mismatched := make([]string, 0)
+	// only compare if we set it
+	if o.mode != nil {
+		if s.FileMode() != *o.mode {
+			mismatched = append(mismatched, "mode")
+		}
+	}
+
+	if o.accessTime != nil {
+		if o.accessTime.UnixNano() != s.ATime().UnixNano() {
+			mismatched = append(mismatched, "atime")
+		}
+	}
+
+	if o.modTime != nil {
+		if o.modTime.UnixNano() != s.MTime().UnixNano() {
+			mismatched = append(mismatched, "mtime")
+		}
+	}
+
+	return strings.Join(mismatched, ", ")
+}
+
+func (o *objectUnixStatContainer) AddToMetadata(metadata map[string]*string) {
+	if o == nil {
+		return
+	}
+
+	mask := uint32(0)
+
+	if o.mode != nil { // always overwrite; perhaps it got changed in one of the hooks.
+		mask |= common.STATX_MODE
+		metadata[common.POSIXModeMeta] = to.Ptr(strconv.FormatUint(uint64(*o.mode), 10))
+
+		delete(metadata, common.POSIXFIFOMeta)
+		delete(metadata, common.POSIXSocketMeta)
+		switch {
+		case *o.mode&common.S_IFIFO == common.S_IFIFO:
+			metadata[common.POSIXFIFOMeta] = to.Ptr("true")
+		case *o.mode&common.S_IFSOCK == common.S_IFSOCK:
+			metadata[common.POSIXSocketMeta] = to.Ptr("true")
+		}
+	}
+
+	if o.accessTime != nil {
+		mask |= common.STATX_ATIME
+		metadata[common.POSIXATimeMeta] = to.Ptr(strconv.FormatInt(o.accessTime.UnixNano(), 10))
+	}
+
+	if o.modTime != nil {
+		mask |= common.STATX_MTIME
+		metadata[common.POSIXModTimeMeta] = to.Ptr(strconv.FormatInt(o.modTime.UnixNano(), 10))
+	}
+
+	metadata[common.LINUXStatxMaskMeta] = to.Ptr(strconv.FormatUint(uint64(mask), 10))
 }
 
 // returns op.size, if present, else defaultSize
@@ -120,7 +238,16 @@ func (op objectProperties) sizeBytes(a asserter, defaultSize string) int {
 
 func (op objectProperties) DeepCopy() objectProperties {
 	ret := objectProperties{}
-	ret.isFolder = op.isFolder
+	ret.entityType = op.entityType
+
+	if op.symlinkTarget != nil {
+		target := *op.symlinkTarget
+		ret.symlinkTarget = &target
+	}
+
+	if !op.posixProperties.Empty() {
+		ret.posixProperties = op.posixProperties.DeepCopy()
+	}
 
 	if op.size != nil {
 		val := op.size
@@ -131,7 +258,7 @@ func (op objectProperties) DeepCopy() objectProperties {
 		ret.contentHeaders = op.contentHeaders.DeepCopy()
 	}
 
-	ret.nameValueMetadata = make(map[string]string)
+	ret.nameValueMetadata = make(map[string]*string)
 	for k, v := range op.nameValueMetadata {
 		ret.nameValueMetadata[k] = v
 	}
@@ -139,6 +266,10 @@ func (op objectProperties) DeepCopy() objectProperties {
 	ret.blobTags = make(map[string]string)
 	for k, v := range op.blobTags {
 		ret.blobTags[k] = v
+	}
+
+	if op.blobVersions != nil {
+		ret.blobVersions = pointerTo(*op.blobVersions)
 	}
 
 	if op.creationTime != nil {
@@ -184,6 +315,8 @@ type testObject struct {
 	name                   string
 	expectedFailureMessage string // the failure message that we expect to see in the log for this file/folder (only populated for expected failures)
 
+	body []byte
+
 	// info to be used at creation time. Usually, creationInfo and and verificationInfo will be the same
 	// I.e. we expect the creation properties to be preserved. But, for flexibility, they can be set to something different.
 	creationProperties objectProperties
@@ -197,6 +330,11 @@ func (t *testObject) DeepCopy() *testObject {
 	ret.expectedFailureMessage = t.expectedFailureMessage
 	ret.creationProperties = t.creationProperties.DeepCopy()
 
+	if t.body != nil {
+		ret.body = make([]byte, len(t.body))
+		copy(ret.body, t.body)
+	}
+
 	if t.verificationProperties != nil {
 		vp := (*t.verificationProperties).DeepCopy()
 		ret.verificationProperties = &vp
@@ -205,11 +343,20 @@ func (t *testObject) DeepCopy() *testObject {
 	return &ret
 }
 
-func (t *testObject) isFolder() bool {
-	if t.verificationProperties != nil && t.creationProperties.isFolder != t.verificationProperties.isFolder {
-		panic("isFolder properties are misconfigured")
+func (t *testObject) hasContentToValidate() bool {
+	if t.verificationProperties != nil && t.creationProperties.entityType != t.verificationProperties.entityType {
+		panic("entityType property is misconfigured")
 	}
-	return t.creationProperties.isFolder
+
+	return t.creationProperties.entityType == common.EEntityType.File()
+}
+
+func (t *testObject) isFolder() bool {
+	if t.verificationProperties != nil && t.creationProperties.entityType != t.verificationProperties.entityType {
+		panic("entityType property is misconfigured")
+	}
+
+	return t.creationProperties.entityType == common.EEntityType.Folder()
 }
 
 func (t *testObject) isRootFolder() bool {
@@ -284,6 +431,21 @@ func f(n string, properties ...withPropertyProvider) *testObject {
 	return result
 }
 
+func symlink(new, target string) *testObject {
+	name := strings.TrimLeft(new, "/")
+	result := f(name)
+
+	// result.creationProperties
+	result.creationProperties.entityType = common.EEntityType.Symlink()
+	result.creationProperties.symlinkTarget = &target
+
+	result.verificationProperties = &objectProperties{}
+	result.verificationProperties.entityType = common.EEntityType.Symlink()
+	result.verificationProperties.symlinkTarget = &target
+
+	return result
+}
+
 // define a folder, in the expectations lists on a testFiles struct
 func folder(n string, properties ...withPropertyProvider) *testObject {
 	name := strings.TrimLeft(n, "/")
@@ -291,9 +453,9 @@ func folder(n string, properties ...withPropertyProvider) *testObject {
 
 	// isFolder is at properties level, not testObject level, because we need it at properties level when reading
 	// the properties back from the destination (where we don't read testObjects, we just read objectProperties)
-	result.creationProperties.isFolder = true
+	result.creationProperties.entityType = common.EEntityType.Folder()
 	if result.verificationProperties != nil {
-		result.verificationProperties.isFolder = true
+		result.verificationProperties.entityType = common.EEntityType.Folder()
 	}
 
 	return result
@@ -301,14 +463,27 @@ func folder(n string, properties ...withPropertyProvider) *testObject {
 
 //////////
 
+type objectTarget struct {
+	objectName string
+	snapshotid bool // add snapshot id
+	// versions specifies a zero-indexed list of versions to copy.
+	// ID is automatically filled in based off the versions specified in this field.
+	// Nil or empty list does nothing. A single version ID will be passed as a part of the URI,
+	// unless singleVersionList is true.
+	// Negative cases for list of versions, e.g. specifying nonexistent versions, shouldn't be done here.
+	// Those get trimmed out by the traverser.
+	versions          []uint
+	singleVersionList bool
+}
+
 // Represents a set of source files, including what we expect should happen to them
 // Our expectations, e.g. success or failure, are represented by whether we put each file into
 // "shouldTransfer", "shouldFail" etc.
 type testFiles struct {
-	defaultSize  string                  // how big should the files be? Applies to those files that don't specify individual sizes. Uses the same K, M, G suffixes as benchmark mode's size-per-file
-	objectTarget string                  // should we target only a single file/folder?
-	destTarget   string                  // do we want to copy under a folder or rename?
-	sourcePublic azblob.PublicAccessType // should the source blob container be public? (ONLY APPLIES TO BLOB.)
+	defaultSize  string                      // how big should the files be? Applies to those files that don't specify individual sizes. Uses the same K, M, G suffixes as benchmark mode's size-per-file
+	objectTarget objectTarget                // should we target only a single file/folder?
+	destTarget   string                      // do we want to copy under a folder or rename?
+	sourcePublic *container.PublicAccessType // should the source blob container be public? (ONLY APPLIES TO BLOB.)
 
 	// The files/folders that we expect to be transferred. Elements of the list must be strings or testObject's.
 	// A string can be used if no properties need to be specified.
@@ -366,17 +541,19 @@ func (*testFiles) copyList(src []interface{}) []interface{} {
 
 // takes a mixed list of (potentially) strings and testObjects, and returns them all as test objects
 // TODO: do we want to continue supporting plain strings in the expectation file lists (for convenience of test coders)
-//   or force them to use f() for every file?
+//
+//	or force them to use f() for every file?
 func (*testFiles) toTestObjects(rawList []interface{}, isFail bool) []*testObject {
 	result := make([]*testObject, 0, len(rawList))
-	for _, r := range rawList {
+	for k, r := range rawList {
 		if asTestObject, ok := r.(*testObject); ok {
 			if asTestObject.expectedFailureMessage != "" && !isFail {
 				panic("expected failures are only allowed in the shouldFail list. They are not allowed for other test files")
 			}
 			result = append(result, asTestObject)
 		} else if asString, ok := r.(string); ok {
-			result = append(result, &testObject{name: asString})
+			rawList[k] = &testObject{name: asString} // convert to a full deal so we can apply md5
+			result = append(result, rawList[k].(*testObject))
 		} else {
 			panic("testFiles lists may contain only strings and testObjects. Create your test objects with the f() and folder() functions")
 		}
@@ -397,7 +574,35 @@ func (tf *testFiles) allObjects(isSource bool) []*testObject {
 	return tf.toTestObjects(tf.shouldSkip, false)
 }
 
-func (tf *testFiles) getForStatus(status common.TransferStatus, expectFolders bool, expectRootFolder bool) []*testObject {
+func (tf *testFiles) isListOfVersions() bool {
+	return tf.objectTarget.objectName != "" && (len(tf.objectTarget.versions) > 1 || (len(tf.objectTarget.versions) == 1 && tf.objectTarget.singleVersionList))
+}
+
+func (tf *testFiles) getForStatus(s *scenario, status common.TransferStatus, expectFolders bool, expectRootFolder bool) []*testObject {
+	if status == common.ETransferStatus.Success() && tf.isListOfVersions() {
+		s.a.Assert(s.fromTo.From(), equals(), common.ELocation.Blob(), "List of Versions must be used with Blob")
+		versions := s.GetSource().(*resourceBlobContainer).getVersions(s.a, tf.objectTarget.objectName)
+
+		// track down the original testObject
+		var target *testObject
+		for _, v := range tf.toTestObjects(tf.shouldTransfer, false) {
+			if v.name == tf.objectTarget.objectName {
+				target = v
+				break
+			}
+		}
+		s.a.Assert(target, notEquals(), nil, "objectTarget must exist in successful transfers")
+
+		out := make([]*testObject, len(tf.objectTarget.versions))
+		for k, v := range tf.objectTarget.versions {
+			// flatten the version ID
+			versions[v] = strings.ReplaceAll(versions[v], ":", "-")
+			out[k] = target.DeepCopy()
+			out[k].name = versions[v] + "-" + out[k].name
+		}
+		return out
+	}
+
 	shouldInclude := func(f *testObject) bool {
 		if !f.isFolder() {
 			return true

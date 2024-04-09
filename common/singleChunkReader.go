@@ -25,10 +25,7 @@ import (
 	"errors"
 	"hash"
 	"io"
-	"runtime"
 	"sync"
-
-	"github.com/Azure/azure-pipeline-go/pipeline"
 )
 
 // Reader of ONE chunk of a file. Maybe used to re-read multiple times (e.g. if
@@ -227,14 +224,20 @@ func (cr *singleChunkReader) blockingPrefetch(fileReader io.ReaderAt, isRetry bo
 	// Must use "relaxed" RAM limit IFF this is a retry.  Else, we can, in theory, get deadlock with all active goroutines blocked
 	// here doing retries, but no RAM _will_ become available because its
 	// all used by queued chunkfuncs (that can't be processed because all goroutines are active).
-	cr.chunkLogger.LogChunkStatus(cr.chunkId, EWaitReason.RAMToSchedule())
+	if cr.chunkLogger != nil {
+		cr.chunkLogger.LogChunkStatus(cr.chunkId, EWaitReason.RAMToSchedule())
+	}
+
 	err := cr.cacheLimiter.WaitUntilAdd(cr.ctx, cr.length, func() bool { return isRetry })
 	if err != nil {
 		return err
 	}
 
 	// prepare to read
-	cr.chunkLogger.LogChunkStatus(cr.chunkId, EWaitReason.DiskIO())
+	if cr.chunkLogger != nil {
+		cr.chunkLogger.LogChunkStatus(cr.chunkId, EWaitReason.DiskIO())
+	}
+
 	targetBuffer := cr.slicePool.RentSlice(cr.length)
 
 	// read WITHOUT holding the "close" lock.  While we don't have the lock, we mutate ONLY local variables, no instance state.
@@ -400,7 +403,7 @@ func (cr *singleChunkReader) Close() error {
 	// This check originates from issue 191. Even tho we think we've now resolved that issue,
 	// we'll keep this code just to make sure.
 	if cr.positionInChunk < cr.length && cr.ctx.Err() == nil {
-		cr.generalLogger.Log(pipeline.LogInfo, "Early close of chunk in singleChunkReader with context still active")
+		cr.generalLogger.Log(LogInfo, "Early close of chunk in singleChunkReader with context still active")
 		// cannot panic here, since this code path is NORMAL in the case of sparse files to Azure Files and Page Blobs
 	}
 
@@ -412,6 +415,18 @@ func (cr *singleChunkReader) Close() error {
 	// do the real work
 	cr.closeBuffer()
 	cr.isClosed = true
+
+	/*
+	 * Set chunkLogger to nil, so that chunkStatusLogger can be GC'ed.
+	 *
+	 * TODO: We should not need to explicitly set this to nil but today we have a yet-unknown ref on cr which
+	 *       is leaking this "big" chunkStatusLogger memory, so we cause that to be freed by force dropping this ref.
+	 *
+	 * Note: We are force setting this to nil and we safe guard against this by checking chunklogger not nil at respective places.
+	 *       At present this is called only from blockingPrefetch().
+	 */
+	cr.chunkLogger = nil
+
 	return nil
 }
 
@@ -436,7 +451,7 @@ func (cr *singleChunkReader) GetPrologueState() PrologueState {
 	// unuse before Seek, since Seek is public
 	cr.unuse()
 	// MUST re-wind, so that the bytes we read will get transferred too!
-	_, err = cr.Seek(0, io.SeekStart)
+	_, _ = cr.Seek(0, io.SeekStart)
 	return PrologueState{LeadingBytes: leadingBytes}
 }
 
@@ -453,16 +468,5 @@ func (cr *singleChunkReader) WriteBufferTo(h hash.Hash) {
 	_, err := h.Write(cr.buffer)
 	if err != nil {
 		panic("documentation of hash.Hash.Write says it will never return an error")
-	}
-}
-
-func stack() []byte {
-	buf := make([]byte, 2048)
-	for {
-		n := runtime.Stack(buf, false)
-		if n < len(buf) {
-			return buf[:n]
-		}
-		buf = make([]byte, 2*len(buf))
 	}
 }

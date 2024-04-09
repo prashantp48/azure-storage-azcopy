@@ -23,17 +23,21 @@ package cmd
 import (
 	"context"
 	"fmt"
-	pipeline2 "github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake"
 	"net/url"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/datalakeerror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azdatalake/filesystem"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/fileerror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/share"
+
 	"errors"
 
-	"github.com/Azure/azure-storage-azcopy/v10/azbfs"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/ste"
-	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/Azure/azure-storage-file-go/azfile"
 	"github.com/spf13/cobra"
 )
 
@@ -77,67 +81,87 @@ func (cookedArgs cookedMakeCmdArgs) process() (err error) {
 		return err
 	}
 
+	if err := common.VerifyIsURLResolvable(resourceStringParts.Value); cookedArgs.resourceLocation.IsRemote() && err != nil {
+		return fmt.Errorf("failed to resolve target: %w", err)
+	}
+
 	credentialInfo, _, err := GetCredentialInfoForLocation(ctx, cookedArgs.resourceLocation, resourceStringParts.Value, resourceStringParts.SAS, false, common.CpkOptions{})
 	if err != nil {
 		return err
 	}
 
+	// Note : trailing dot is only applicable to file operations anyway, so setting this to false
+	options := createClientOptions(common.AzcopyCurrentJobLogger, nil)
+	resourceURL := cookedArgs.resourceURL.String()
+	cred := credentialInfo.OAuthTokenInfo.TokenCredential
+
 	switch cookedArgs.resourceLocation {
 	case common.ELocation.BlobFS():
-		p, err := createBlobFSPipeline(ctx, credentialInfo, pipeline2.LogNone)
+		var filesystemClient *filesystem.Client
+		if credentialInfo.CredentialType.IsAzureOAuth() {
+			filesystemClient, err = filesystem.NewClient(resourceURL, cred, &filesystem.ClientOptions{ClientOptions: options})
+		} else if credentialInfo.CredentialType.IsSharedKey() {
+			var sharedKeyCred *azdatalake.SharedKeyCredential
+			sharedKeyCred, err = common.GetDatalakeSharedKeyCredential()
+			if err != nil {
+				return err
+			}
+			filesystemClient, err = filesystem.NewClientWithSharedKeyCredential(resourceURL, sharedKeyCred, &filesystem.ClientOptions{ClientOptions: options})
+		} else {
+			filesystemClient, err = filesystem.NewClientWithNoCredential(resourceURL, &filesystem.ClientOptions{ClientOptions: options})
+		}
 		if err != nil {
 			return err
 		}
-		// here we assume the resourceURL is a proper file system URL
-		fsURL := azbfs.NewFileSystemURL(cookedArgs.resourceURL, p)
-		if _, err = fsURL.Create(ctx); err != nil {
-			// print a nicer error message if file system already exists
-			if storageErr, ok := err.(azbfs.StorageError); ok {
-				if storageErr.ServiceCode() == azbfs.ServiceCodeFileSystemAlreadyExists {
-					return fmt.Errorf("the file system already exists")
-				} else if storageErr.ServiceCode() == azbfs.ServiceCodeResourceNotFound {
-					return fmt.Errorf("please specify a valid file system URL with corresponding credentials")
-				}
-			}
 
+		if _, err = filesystemClient.Create(ctx, nil); err != nil {
+			// print a nicer error message if container already exists
+			if datalakeerror.HasCode(err, datalakeerror.FileSystemAlreadyExists) {
+				return fmt.Errorf("the filesystem already exists")
+			} else if datalakeerror.HasCode(err, datalakeerror.ResourceNotFound) {
+				return fmt.Errorf("please specify a valid filesystem URL with corresponding credentials")
+			}
 			// print the ugly error if unexpected
 			return err
 		}
 	case common.ELocation.Blob():
-		p, err := createBlobPipeline(ctx, credentialInfo, pipeline2.LogNone)
+		// TODO : Ensure it is a container URL here and fail early?
+		var containerClient *container.Client
+		if credentialInfo.CredentialType.IsAzureOAuth() {
+			containerClient, err = container.NewClient(resourceURL, cred, &container.ClientOptions{ClientOptions: options})
+		} else {
+			containerClient, err = container.NewClientWithNoCredential(resourceURL, &container.ClientOptions{ClientOptions: options})
+		}
 		if err != nil {
 			return err
 		}
-		containerURL := azblob.NewContainerURL(cookedArgs.resourceURL, p)
-		if _, err = containerURL.Create(ctx, nil, azblob.PublicAccessNone); err != nil {
+		if _, err = containerClient.Create(ctx, nil); err != nil {
 			// print a nicer error message if container already exists
-			if storageErr, ok := err.(azblob.StorageError); ok {
-				if storageErr.ServiceCode() == azblob.ServiceCodeContainerAlreadyExists {
-					return fmt.Errorf("the container already exists")
-				} else if storageErr.ServiceCode() == azblob.ServiceCodeResourceNotFound {
-					return fmt.Errorf("please specify a valid container URL with account SAS")
-				}
+			if bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
+				return fmt.Errorf("the container already exists")
+			} else if bloberror.HasCode(err, bloberror.ResourceNotFound) {
+				return fmt.Errorf("please specify a valid container URL with corresponding credentials")
 			}
-
 			// print the ugly error if unexpected
 			return err
 		}
 	case common.ELocation.File():
-		p, err := createFilePipeline(ctx, credentialInfo, pipeline2.LogNone)
+		var shareClient *share.Client
+		shareClient, err = share.NewClientWithNoCredential(resourceURL, &share.ClientOptions{ClientOptions: options})
 		if err != nil {
 			return err
 		}
-		shareURL := azfile.NewShareURL(cookedArgs.resourceURL, p)
-		if _, err = shareURL.Create(ctx, nil, cookedArgs.quota); err != nil {
+		quota := &cookedArgs.quota
+		if quota != nil && *quota == 0 {
+			quota = nil
+		}
+		if _, err = shareClient.Create(ctx, &share.CreateOptions{Quota: quota}); err != nil {
 			// print a nicer error message if share already exists
-			if storageErr, ok := err.(azfile.StorageError); ok {
-				if storageErr.ServiceCode() == azfile.ServiceCodeShareAlreadyExists {
-					return fmt.Errorf("the file share already exists")
-				} else if storageErr.ServiceCode() == azfile.ServiceCodeResourceNotFound {
-					return fmt.Errorf("please specify a valid share URL with account SAS")
-				}
+			if fileerror.HasCode(err, fileerror.ShareAlreadyExists) {
+				return fmt.Errorf("the file share already exists")
+			} else if fileerror.HasCode(err, fileerror.ResourceNotFound) {
+				return fmt.Errorf("please specify a valid share URL with corresponding credentials")
 			}
-
 			// print the ugly error if unexpected
 			return err
 		}

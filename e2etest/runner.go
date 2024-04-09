@@ -26,6 +26,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -52,10 +54,24 @@ var isLaunchedByDebugger = func() bool {
 	return false
 }()
 
-func (t *TestRunner) SetAllFlags(p params, o Operation) {
+func (t *TestRunner) SetAllFlags(s *scenario) {
+	p := s.p
+	o := s.operation
+
 	set := func(key string, value interface{}, dflt interface{}, formats ...string) {
 		if value == dflt {
 			return // nothing to do. The flag is not supposed to be set
+		}
+
+		reflectVal := reflect.ValueOf(value) // check for pointer
+		if reflectVal.Kind() == reflect.Pointer {
+			result := reflectVal.Elem() // attempt to deref
+
+			if result != (reflect.Value{}) && result.CanInterface() { // can we grab the underlying value?
+				value = result.Interface()
+			} else {
+				return // nothing to use
+			}
 		}
 
 		format := "%v"
@@ -64,6 +80,18 @@ func (t *TestRunner) SetAllFlags(p params, o Operation) {
 		}
 
 		t.flags[key] = fmt.Sprintf(format, value)
+	}
+
+	if o == eOperation.Benchmark() {
+		set("mode", p.mode, "")
+		set("file-count", p.fileCount, 0)
+		set("size-per-file", p.sizePerFile, "")
+		return
+	}
+
+	if o == eOperation.Cancel() {
+		set("ignore-error-if-completed", p.ignoreErrorIfCompleted, "")
+		return
 	}
 
 	// TODO: TODO: nakulkar-msft there will be many more to add here
@@ -82,7 +110,7 @@ func (t *TestRunner) SetAllFlags(p params, o Operation) {
 	set("s2s-detect-source-changed", p.s2sSourceChangeValidation, false)
 	set("metadata", p.metadata, "")
 	set("cancel-from-stdin", p.cancelFromStdin, false)
-	set("preserve-smb-info", p.preserveSMBInfo, false)
+	set("preserve-smb-info", p.preserveSMBInfo, nil)
 	set("preserve-smb-permissions", p.preserveSMBPermissions, false)
 	set("backup", p.backupMode, false)
 	set("blob-tags", p.blobTags, "")
@@ -92,8 +120,54 @@ func (t *TestRunner) SetAllFlags(p params, o Operation) {
 	set("cpk-by-value", p.cpkByValue, false)
 	set("is-object-dir", p.isObjectDir, false)
 	set("debug-skip-files", strings.Join(p.debugSkipFiles, ";"), "")
+	set("check-md5", p.checkMd5.String(), "FailIfDifferent")
+	set("trailing-dot", p.trailingDot.String(), "Enable")
+	set("force-if-read-only", p.forceIfReadOnly, false)
+	set("delete-destination-file", p.deleteDestinationFile, false)
+
 	if o == eOperation.Copy() {
 		set("s2s-preserve-access-tier", p.s2sPreserveAccessTier, true)
+		set("preserve-posix-properties", p.preservePOSIXProperties, "")
+
+		switch p.symlinkHandling {
+		case common.ESymlinkHandlingType.Follow():
+			set("follow-symlinks", true, nil)
+		case common.ESymlinkHandlingType.Preserve():
+			set("preserve-symlinks", true, nil)
+		}
+
+		target := s.GetTestFiles().objectTarget
+		if s.fromTo.From() == common.ELocation.Blob() && s.fs.isListOfVersions() { // Otherwise, it must be a list.
+			s.a.Assert(s.fromTo.From(), equals(), common.ELocation.Blob(), "list of files can only be used in blob.")
+
+			versions := s.GetSource().(*resourceBlobContainer).getVersions(s.a, target.objectName)
+			s.a.Assert(len(versions) > 0, equals(), true, "blob was expected to have versions!")
+			listOfVersions := make([]string, len(target.versions))
+
+			for idx, val := range target.versions {
+				s.a.Assert(int(val) < len(versions), equals(), true, fmt.Sprintf("Not enough versions are present! (needed version %d of %d)", val, len(versions)))
+				listOfVersions[idx] = versions[val]
+			}
+
+			file, err := os.CreateTemp("", "listofversions*.json")
+			defer func(file *os.File) {
+				_ = file.Close()
+			}(file)
+			s.a.AssertNoErr(err, "create temp list of versions file")
+
+			for _, v := range listOfVersions {
+				_, err = file.WriteString(v + "\n")
+				s.a.AssertNoErr(err, "write to list of versions file")
+			}
+
+			set("list-of-versions", file.Name(), "")
+		}
+	} else if o == eOperation.Sync() {
+		set("delete-destination", p.deleteDestination.String(), "False")
+		set("preserve-posix-properties", p.preservePOSIXProperties, false)
+		set("compare-hash", p.compareHash.String(), "None")
+		set("local-hash-storage-mode", p.hashStorageMode.String(), common.EHashStorageMode.Default().String())
+		set("hash-meta-dir", p.hashStorageDir, "")
 	}
 }
 
@@ -106,18 +180,24 @@ func (t *TestRunner) computeArgs() []string {
 	for key, value := range t.flags {
 		args = append(args, fmt.Sprintf("--%s=%s", key, value))
 	}
+	args = append(args, "--log-level=DEBUG")
 
 	return append(args, "--output-type=json")
 }
 
 // execCommandWithOutput replaces Go's exec.Command().Output, but appends an extra parameter and
 // breaks up the c.Run() call into its component parts. Both changes are to assist debugging
-func (t *TestRunner) execDebuggableWithOutput(name string, args []string, afterStart func() string, chToStdin <-chan string) ([]byte, error) {
+func (t *TestRunner) execDebuggableWithOutput(name string, args []string, env []string, afterStart func() string, chToStdin <-chan string) ([]byte, error) {
 	debug := isLaunchedByDebugger
 	if debug {
 		args = append(args, "--await-continue")
 	}
 	c := exec.Command(name, args...)
+
+	// add environment variables
+	if env != nil {
+		c.Env = env
+	}
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -129,11 +209,11 @@ func (t *TestRunner) execDebuggableWithOutput(name string, args []string, afterS
 	c.Stdout = &stdout
 	c.Stderr = &stderr
 
-	//instead of err := c.Run(), we do the following
+	// instead of err := c.Run(), we do the following
 	runErr := c.Start()
 	if runErr == nil {
 		defer func() {
-			_ = c.Process.Kill() // in case we never finish c.Wait() below, and get paniced or killed
+			_ = c.Process.Kill() // in case we never finish c.Wait() below, and get panicked or killed
 		}()
 
 		if debug {
@@ -175,7 +255,7 @@ func (t *TestRunner) execDebuggableWithOutput(name string, args []string, afterS
 	return stdout.Bytes(), runErr
 }
 
-func (t *TestRunner) ExecuteAzCopyCommand(operation Operation, src, dst string, afterStart func() string, chToStdin <-chan string) (CopyOrSyncCommandResult, bool, error) {
+func (t *TestRunner) ExecuteAzCopyCommand(operation Operation, src, dst string, needsOAuth bool, needsFromTo bool, fromTo common.FromTo, afterStart func() string, chToStdin <-chan string, logDir string) (CopyOrSyncCommandResult, bool, error) {
 	capLen := func(b []byte) []byte {
 		if len(b) < 1024 {
 			return b
@@ -194,18 +274,52 @@ func (t *TestRunner) ExecuteAzCopyCommand(operation Operation, src, dst string, 
 		verb = "remove"
 	case eOperation.Resume():
 		verb = "jobs resume"
+	case eOperation.Cancel():
+		verb = "cancel"
+	case eOperation.Benchmark():
+		verb = "bench"
 	default:
 		panic("unsupported operation type")
 	}
 
 	args := append(strings.Split(verb, " "), src, dst)
-	if operation == eOperation.Remove() {
+	if operation == eOperation.Remove() || operation == eOperation.Benchmark() {
 		args = args[:2]
 	} else if operation == eOperation.Resume() {
 		args = args[:3]
+	} else if operation == eOperation.Cancel() {
+		args = args[:2]
 	}
 	args = append(args, t.computeArgs()...)
-	out, err := t.execDebuggableWithOutput(GlobalInputManager{}.GetExecutablePath(), args, afterStart, chToStdin)
+	if needsFromTo {
+		args = append(args, "--from-to="+fromTo.String())
+	}
+
+	// pass along existing environment variables (because $HOME doesn't come along if we just use the OAuth vars, that can be troublesome!)
+	env := make([]string, len(os.Environ()))
+	copy(env, os.Environ())
+
+	// paste in OAuth environment variables if not specified
+	if needsOAuth && os.Getenv("AZCOPY_AUTO_LOGIN_TYPE") == "" {
+		tenId, appId, clientSecret := GlobalInputManager{}.GetServicePrincipalAuth()
+
+		env = append(env,
+			"AZCOPY_AUTO_LOGIN_TYPE=SPN",
+			"AZCOPY_SPA_APPLICATION_ID="+appId,
+			"AZCOPY_SPA_CLIENT_SECRET="+clientSecret,
+		)
+
+		if tenId != "" {
+			env = append(env, "AZCOPY_TENANT_ID="+tenId)
+		}
+	}
+
+	if logDir != "" {
+		env = append(env, "AZCOPY_LOG_LOCATION="+logDir)
+		env = append(env, "AZCOPY_JOB_PLAN_LOCATION="+filepath.Join(logDir, "plans"))
+	}
+
+	out, err := t.execDebuggableWithOutput(GlobalInputManager{}.GetExecutablePath(), args, env, afterStart, chToStdin)
 
 	wasClean := true
 	stdErr := make([]byte, 0)
@@ -239,9 +353,15 @@ func (t *TestRunner) SetTransferStatusFlag(value string) {
 	t.flags["with-status"] = value
 }
 
-func (t *TestRunner) ExecuteJobsShowCommand(jobID common.JobID) (JobsShowCommandResult, error) {
+func (t *TestRunner) ExecuteJobsShowCommand(jobID common.JobID, azcopyDir string) (JobsShowCommandResult, error) {
 	args := append([]string{"jobs", "show", jobID.String()}, t.computeArgs()...)
-	out, err := exec.Command(GlobalInputManager{}.GetExecutablePath(), args...).Output()
+	cmd := exec.Command(GlobalInputManager{}.GetExecutablePath(), args...)
+
+	if azcopyDir != "" {
+		cmd.Env = append(cmd.Env, "AZCOPY_JOB_PLAN_LOCATION="+filepath.Join(azcopyDir, "plans"))
+	}
+
+	out, err := cmd.Output()
 	if err != nil {
 		return JobsShowCommandResult{}, err
 	}
@@ -278,12 +398,12 @@ func newCopyOrSyncCommandResult(rawOutput string) (CopyOrSyncCommandResult, bool
 	return CopyOrSyncCommandResult{jobID: jobSummary.JobID, finalStatus: jobSummary}, true
 }
 
-func (c *CopyOrSyncCommandResult) GetTransferList(status common.TransferStatus) ([]common.TransferDetail, error) {
+func (c *CopyOrSyncCommandResult) GetTransferList(status common.TransferStatus, azcopyDir string) ([]common.TransferDetail, error) {
 	runner := newTestRunner()
 	runner.SetTransferStatusFlag(status.String())
 
 	// invoke AzCopy to get the status from the plan files
-	result, err := runner.ExecuteJobsShowCommand(c.jobID)
+	result, err := runner.ExecuteJobsShowCommand(c.jobID, azcopyDir)
 	if err != nil {
 		return make([]common.TransferDetail, 0), err
 	}

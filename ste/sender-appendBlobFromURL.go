@@ -21,21 +21,19 @@
 package ste
 
 import (
-	"net/url"
-
-	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/appendblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 type urlToAppendBlobCopier struct {
 	appendBlobSenderBase
 
-	srcURL url.URL
+	srcURL string
 }
 
-func newURLToAppendBlobCopier(jptm IJobPartTransferMgr, destination string, p pipeline.Pipeline, pacer pacer, srcInfoProvider IRemoteSourceInfoProvider) (s2sCopier, error) {
-	senderBase, err := newAppendBlobSenderBase(jptm, destination, p, pacer, srcInfoProvider)
+func newURLToAppendBlobCopier(jptm IJobPartTransferMgr, destination string, pacer pacer, srcInfoProvider IRemoteSourceInfoProvider) (s2sCopier, error) {
+	senderBase, err := newAppendBlobSenderBase(jptm, destination, pacer, srcInfoProvider)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +45,7 @@ func newURLToAppendBlobCopier(jptm IJobPartTransferMgr, destination string, p pi
 
 	return &urlToAppendBlobCopier{
 		appendBlobSenderBase: *senderBase,
-		srcURL:               *srcURL}, nil
+		srcURL:               srcURL}, nil
 }
 
 // Returns a chunk-func for blob copies
@@ -58,25 +56,29 @@ func (c *urlToAppendBlobCopier) GenerateCopyFunc(id common.ChunkID, blockIndex i
 		if err := c.pacer.RequestTrafficAllocation(c.jptm.Context(), adjustedChunkSize); err != nil {
 			c.jptm.FailActiveUpload("Pacing block", err)
 		}
-		_, err := c.destAppendBlobURL.AppendBlockFromURL(c.jptm.Context(), c.srcURL, id.OffsetInFile(), adjustedChunkSize,
-			azblob.AppendBlobAccessConditions{
-				AppendPositionAccessConditions: azblob.AppendPositionAccessConditions{IfAppendPositionEqual: id.OffsetInFile()},
-			}, azblob.ModifiedAccessConditions{}, nil, c.cpkToApply)
+		offset := id.OffsetInFile()
+		token, err := c.jptm.GetS2SSourceTokenCredential(c.jptm.Context())
 		if err != nil {
-			c.jptm.FailActiveS2SCopy("Appending block from URL", err)
+			c.jptm.FailActiveS2SCopy("Getting source token credential", err)
+			return
+		}
+		var timeoutFromCtx bool
+		ctx := withTimeoutNotification(c.jptm.Context(), &timeoutFromCtx)
+		_, err = c.destAppendBlobClient.AppendBlockFromURL(ctx, c.srcURL,
+			&appendblob.AppendBlockFromURLOptions{
+				Range:                          blob.HTTPRange{Offset: offset, Count: adjustedChunkSize},
+				AppendPositionAccessConditions: &appendblob.AppendPositionAccessConditions{AppendPosition: &offset},
+				CPKInfo:                        c.jptm.CpkInfo(),
+				CPKScopeInfo:                   c.jptm.CpkScopeInfo(),
+				CopySourceAuthorization:        token,
+			})
+		errString, err := c.transformAppendConditionMismatchError(timeoutFromCtx, offset, adjustedChunkSize, err)
+		if err != nil {
+			errString = "Appending block from URL" + errString
+			c.jptm.FailActiveS2SCopy(errString, err)
 			return
 		}
 	}
 
 	return c.generateAppendBlockToRemoteFunc(id, appendBlockFromURL)
-}
-
-// GetDestinationLength gets the destination length.
-func (c *urlToAppendBlobCopier) GetDestinationLength() (int64, error) {
-	properties, err := c.destAppendBlobURL.GetProperties(c.jptm.Context(), azblob.BlobAccessConditions{}, c.cpkToApply)
-	if err != nil {
-		return -1, err
-	}
-
-	return properties.ContentLength(), nil
 }

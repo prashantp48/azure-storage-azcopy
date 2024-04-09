@@ -22,16 +22,24 @@ package cmd
 
 import (
 	"context"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	chk "gopkg.in/check.v1"
-	"strings"
 )
 
 type credentialUtilSuite struct{}
 
 var _ = chk.Suite(&credentialUtilSuite{})
 
-func (s *credentialUtilSuite) TestCheckAuthSafeForTarget(c *chk.C) {
+func TestCheckAuthSafeForTarget(t *testing.T) {
+	a := assert.New(t)
 	tests := []struct {
 		ct               common.CredentialType
 		resourceType     common.Location
@@ -49,6 +57,10 @@ func (s *credentialUtilSuite) TestCheckAuthSafeForTarget(c *chk.C) {
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.chinacloudapi.cn", "", true},
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.cloudapi.de", "", true},
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.core.usgovcloudapi.net", "", true},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.windows.net", "", true},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.chinacloudapi.cn", "", true},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.cloudapi.de", "", true},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://myaccount.blob.core.core.usgovcloudapi.net", "", true},
 		{common.ECredentialType.SharedKey(), common.ELocation.BlobFS(), "http://myaccount.dfs.core.windows.net", "", true},
 		{common.ECredentialType.S3AccessKey(), common.ELocation.S3(), "http://something.s3.eu-central-1.amazonaws.com", "", true},
 		{common.ECredentialType.S3AccessKey(), common.ELocation.S3(), "http://something.s3.cn-north-1.amazonaws.com.cn", "", true},
@@ -59,11 +71,13 @@ func (s *credentialUtilSuite) TestCheckAuthSafeForTarget(c *chk.C) {
 
 		// These should fail (they are not storage)
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://somethingelseinazure.windows.net", "", false},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://somethingelseinazure.windows.net", "", false},
 		{common.ECredentialType.S3AccessKey(), common.ELocation.S3(), "http://somethingelseinaws.amazonaws.com", "", false},
 		{common.ECredentialType.GoogleAppCredentials(), common.ELocation.GCP(), "http://appengine.google.com", "", false},
 
 		// As should these (they are nothing to do with the expected URLs)
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://abc.example.com", "", false},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://abc.example.com", "", false},
 		{common.ECredentialType.S3AccessKey(), common.ELocation.S3(), "http://abc.example.com", "", false},
 		{common.ECredentialType.GoogleAppCredentials(), common.ELocation.GCP(), "http://abc.example.com", "", false},
 		// Test that we don't want to send an S3 access key to a blob resource type.
@@ -72,15 +86,18 @@ func (s *credentialUtilSuite) TestCheckAuthSafeForTarget(c *chk.C) {
 
 		// But the same Azure one should pass if the user opts in to them (we don't support any similar override for S3)
 		{common.ECredentialType.OAuthToken(), common.ELocation.Blob(), "http://abc.example.com", "*.foo.com;*.example.com", true},
+		{common.ECredentialType.MDOAuthToken(), common.ELocation.Blob(), "http://abc.example.com", "*.foo.com;*.example.com", true},
 	}
 
 	for i, t := range tests {
 		err := checkAuthSafeForTarget(t.ct, t.resource, t.extraSuffixesAAD, t.resourceType)
-		c.Assert(err == nil, chk.Equals, t.expectedOK, chk.Commentf("Failed on test %d for resource %s", i, t.resource))
+		a.Equal(t.expectedOK, err == nil, chk.Commentf("Failed on test %d for resource %s", i, t.resource))
 	}
 }
 
-func (s *credentialUtilSuite) TestCheckAuthSafeForTargetIsCalledWhenGettingAuthType(c *chk.C) {
+func TestCheckAuthSafeForTargetIsCalledWhenGettingAuthType(t *testing.T) {
+	common.AzcopyJobPlanFolder = os.TempDir()	
+	a := assert.New(t)
 	mockGetCredTypeFromEnvVar := func() common.CredentialType {
 		return common.ECredentialType.OAuthToken() // force it to OAuth, which is the case we want to test
 	}
@@ -89,7 +106,53 @@ func (s *credentialUtilSuite) TestCheckAuthSafeForTargetIsCalledWhenGettingAuthT
 	// that it really does fail.
 	// This checks that our safety check is hooked into the main logic
 	_, _, err := doGetCredentialTypeForLocation(context.Background(), common.ELocation.Blob(), "http://notblob.example.com", "", true, mockGetCredTypeFromEnvVar, common.CpkOptions{})
-	c.Assert(err, chk.NotNil)
-	c.Assert(strings.Contains(err.Error(), "If this URL is in fact an Azure service, you can enable Azure authentication to notblob.example.com."),
-		chk.Equals, true)
+	a.NotNil(err)
+	a.True(strings.Contains(err.Error(), "If this URL is in fact an Azure service, you can enable Azure authentication to notblob.example.com."))
+}
+
+func TestCheckAuthSafeForTargetIsCalledWhenGettingAuthTypeMDOAuth(t *testing.T) {
+	a := assert.New(t)
+	mockGetCredTypeFromEnvVar := func() common.CredentialType {
+		return common.ECredentialType.MDOAuthToken() // force it to OAuth, which is the case we want to test
+	}
+
+	// Call our core cred type getter function, in a way that will fail the safety check, and assert
+	// that it really does fail.
+	// This checks that our safety check is hooked into the main logic
+	_, _, err := doGetCredentialTypeForLocation(context.Background(), common.ELocation.Blob(), "http://notblob.example.com", "", true, mockGetCredTypeFromEnvVar, common.CpkOptions{})
+	a.NotNil(err)
+	a.True(strings.Contains(err.Error(), "If this URL is in fact an Azure service, you can enable Azure authentication to notblob.example.com."))
+}
+
+/*
+ * This function tests that common.isPublic routine is works fine.
+ * Two cases are considered, a blob is public or a container is public.
+ */
+func TestIsPublic(t *testing.T) {
+	a := assert.New(t)
+	ctx, _ := context.WithTimeout(context.TODO(), 5 * time.Minute)
+	bsc := getBlobServiceClient()
+	ctr, _ := getContainerClient(a, bsc)
+	defer ctr.Delete(ctx, nil)
+	
+	publicAccess := container.PublicAccessTypeContainer
+
+	// Create a public container
+	_, err := ctr.Create(ctx, &container.CreateOptions{Access: &publicAccess})
+	a.Nil(err)
+
+	// verify that container is public
+	a.True(isPublic(ctx, ctr.URL(), common.CpkOptions{}))
+
+	publicAccess = container.PublicAccessTypeBlob
+	_, err = ctr.SetAccessPolicy(ctx, &container.SetAccessPolicyOptions{Access: &publicAccess})
+	a.Nil(err)
+
+	// Verify that blob is public.
+	bb, _ := getBlockBlobClient(a, ctr, "")
+	_, err = bb.UploadBuffer(ctx, []byte("I'm a block blob."), nil)
+	a.Nil(err)
+
+	a.True(isPublic(ctx, bb.URL(), common.CpkOptions{}))
+
 }

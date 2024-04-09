@@ -21,8 +21,8 @@
 package cmd
 
 import (
-	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
@@ -30,6 +30,10 @@ import (
 )
 
 var loginCmdArg = loginCmdArgs{tenantID: common.DefaultTenantID}
+
+var loginNotice = "'azcopy %s' command will be deprecated starting release 10.22. " +
+	"Use auto-login instead. Visit %s to know more."
+var autoLoginURL = "https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azcopy-authorize-azure-active-directory#authorize-without-a-secret-store "
 
 var lgCmd = &cobra.Command{
 	Use:        "login",
@@ -45,6 +49,7 @@ var lgCmd = &cobra.Command{
 		loginCmdArg.clientSecret = glcm.GetEnvironmentVariable(common.EEnvironmentVariable.ClientSecret())
 		loginCmdArg.persistToken = true
 
+		glcm.Info(fmt.Sprintf(loginNotice, "login", autoLoginURL))
 		if loginCmdArg.certPass != "" || loginCmdArg.clientSecret != "" {
 			glcm.Info(environmentVariableNotice)
 		}
@@ -72,14 +77,17 @@ func init() {
 	lgCmd.PersistentFlags().BoolVar(&loginCmdArg.servicePrincipal, "service-principal", false, "Log in via Service Principal Name (SPN) by using a certificate or a secret. The client secret or certificate password must be placed in the appropriate environment variable. Type AzCopy env to see names and descriptions of environment variables.")
 	// Client ID of user-assigned identity.
 	lgCmd.PersistentFlags().StringVar(&loginCmdArg.identityClientID, "identity-client-id", "", "Client ID of user-assigned identity.")
-	// Object ID of user-assigned identity.
-	lgCmd.PersistentFlags().StringVar(&loginCmdArg.identityObjectID, "identity-object-id", "", "Object ID of user-assigned identity.")
 	// Resource ID of user-assigned identity.
 	lgCmd.PersistentFlags().StringVar(&loginCmdArg.identityResourceID, "identity-resource-id", "", "Resource ID of user-assigned identity.")
 
 	//login with SPN
 	lgCmd.PersistentFlags().StringVar(&loginCmdArg.applicationID, "application-id", "", "Application ID of user-assigned identity. Required for service principal auth.")
 	lgCmd.PersistentFlags().StringVar(&loginCmdArg.certPath, "certificate-path", "", "Path to certificate for SPN authentication. Required for certificate-based service principal auth.")
+
+	// Deprecate the identity-object-id flag
+	_ = lgCmd.PersistentFlags().MarkHidden("identity-object-id") // Object ID of user-assigned identity.
+	lgCmd.PersistentFlags().StringVar(&loginCmdArg.identityObjectID, "identity-object-id", "", "Object ID of user-assigned identity. This parameter is deprecated. Please use client id or resource id")
+
 }
 
 type loginCmdArgs struct {
@@ -89,6 +97,8 @@ type loginCmdArgs struct {
 
 	identity         bool // Whether to use MSI.
 	servicePrincipal bool
+	azCliCred        bool
+	psCred           bool
 
 	// Info of VM's user assigned identity, client or object ids of the service identity are required if
 	// your VM has multiple user-assigned managed identities.
@@ -103,11 +113,6 @@ type loginCmdArgs struct {
 	certPass      string
 	clientSecret  string
 	persistToken  bool
-}
-
-type argValidity struct {
-	Required string
-	Invalid  string
 }
 
 func (lca loginCmdArgs) validate() error {
@@ -166,20 +171,20 @@ func (lca loginCmdArgs) process() error {
 	case lca.servicePrincipal:
 
 		if lca.certPath != "" {
-			if _, err := uotm.CertLogin(lca.tenantID, lca.aadEndpoint, lca.certPath, lca.certPass, lca.applicationID, lca.persistToken); err != nil {
+			if err := uotm.CertLogin(lca.tenantID, lca.aadEndpoint, lca.certPath, lca.certPass, lca.applicationID, lca.persistToken); err != nil {
 				return err
 			}
 
 			glcm.Info("SPN Auth via cert succeeded.")
 		} else {
-			if _, err := uotm.SecretLogin(lca.tenantID, lca.aadEndpoint, lca.clientSecret, lca.applicationID, lca.persistToken); err != nil {
+			if err := uotm.SecretLogin(lca.tenantID, lca.aadEndpoint, lca.clientSecret, lca.applicationID, lca.persistToken); err != nil {
 				return err
 			}
 
 			glcm.Info("SPN Auth via secret succeeded.")
 		}
 	case lca.identity:
-		if _, err := uotm.MSILogin(context.TODO(), common.IdentityInfo{
+		if err := uotm.MSILogin(common.IdentityInfo{
 			ClientID: lca.identityClientID,
 			ObjectID: lca.identityObjectID,
 			MSIResID: lca.identityResourceID,
@@ -188,8 +193,18 @@ func (lca loginCmdArgs) process() error {
 		}
 		// For MSI login, info success message to user.
 		glcm.Info("Login with identity succeeded.")
+	case lca.azCliCred:
+		if err := uotm.AzCliLogin(lca.tenantID); err != nil {
+			return err
+		}
+		glcm.Info("Login with AzCliCreds succeeded")
+	case lca.psCred:
+		if err := uotm.PSContextToken(lca.tenantID); err != nil {
+			return err
+		}
+		glcm.Info("Login with Powershell context succeeded")
 	default:
-		if _, err := uotm.UserLogin(lca.tenantID, lca.aadEndpoint, lca.persistToken); err != nil {
+		if err := uotm.UserLogin(lca.tenantID, lca.aadEndpoint, lca.persistToken); err != nil {
 			return err
 		}
 		// User fulfills login in browser, and there would be message in browser indicating whether login fulfilled successfully.

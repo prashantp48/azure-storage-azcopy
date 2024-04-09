@@ -30,7 +30,7 @@ import (
 )
 
 // CredCache manages credential caches.
-// Use keyring in Linux OS. Session keyring is choosed,
+// Use keyring in Linux OS. Session keyring is chosen,
 // the session hooks key should be created since user first login (i.e. by pam).
 // So the session is inherited by processes created from login session.
 // When user logout, the session keyring is recycled.
@@ -49,7 +49,7 @@ func NewCredCache(options CredCacheOptions) *CredCache {
 	}
 
 	runtime.SetFinalizer(c, func(CredCache *CredCache) {
-		if CredCache.isPermSet == false && CredCache.key != nil {
+		if !CredCache.isPermSet && CredCache.key != nil {
 			// Indicates Permission is by default ProcessAll, which is not safe and try to recycle the key.
 			// Note: there is no method to grant permission during adding key,
 			// this mechanism is added to ensure key exists only if its permission is set properly.

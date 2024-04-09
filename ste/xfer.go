@@ -21,13 +21,11 @@
 package ste
 
 import (
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/Azure/azure-pipeline-go/pipeline"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
@@ -36,6 +34,7 @@ import (
 const UploadMaxTries = 20
 const UploadRetryDelay = time.Second * 1
 const UploadMaxRetryDelay = time.Second * 60
+
 var UploadTryTimeout = time.Minute * 15
 var ADLSFlushThreshold uint32 = 7500 // The # of blocks to flush at a time-- Implemented only for CI.
 
@@ -57,30 +56,28 @@ var cpkAccessFailureLogGLCM sync.Once
 //////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // These types are define the STE Coordinator
-type newJobXfer func(jptm IJobPartTransferMgr, pipeline pipeline.Pipeline, pacer pacer)
+type newJobXfer func(jptm IJobPartTransferMgr, pacer pacer)
 
 // same as newJobXfer, but with an extra parameter
-type newJobXferWithDownloaderFactory = func(jptm IJobPartTransferMgr, pipeline pipeline.Pipeline, pacer pacer, df downloaderFactory)
-type newJobXferWithSenderFactory = func(jptm IJobPartTransferMgr, pipeline pipeline.Pipeline, pacer pacer, sf senderFactory, sipf sourceInfoProviderFactory)
+type newJobXferWithDownloaderFactory = func(jptm IJobPartTransferMgr, pacer pacer, df downloaderFactory)
+type newJobXferWithSenderFactory = func(jptm IJobPartTransferMgr, pacer pacer, sf senderFactory, sipf sourceInfoProviderFactory)
 
 // Takes a multi-purpose download function, and makes it ready to user with a specific type of downloader
 func parameterizeDownload(targetFunction newJobXferWithDownloaderFactory, df downloaderFactory) newJobXfer {
-	return func(jptm IJobPartTransferMgr, pipeline pipeline.Pipeline, pacer pacer) {
-		targetFunction(jptm, pipeline, pacer, df)
+	return func(jptm IJobPartTransferMgr, pacer pacer) {
+		targetFunction(jptm, pacer, df)
 	}
 }
 
 // Takes a multi-purpose send function, and makes it ready to use with a specific type of sender
 func parameterizeSend(targetFunction newJobXferWithSenderFactory, sf senderFactory, sipf sourceInfoProviderFactory) newJobXfer {
-	return func(jptm IJobPartTransferMgr, pipeline pipeline.Pipeline, pacer pacer) {
-		targetFunction(jptm, pipeline, pacer, sf, sipf)
+	return func(jptm IJobPartTransferMgr, pacer pacer) {
+		targetFunction(jptm, pacer, sf, sipf)
 	}
 }
 
 // the xfer factory is generated based on the type of source and destination
 func computeJobXfer(fromTo common.FromTo, blobType common.BlobType) newJobXfer {
-
-	const blobFSNotS2S = "blobFS not supported as S2S source"
 
 	//local helper functions
 
@@ -108,7 +105,7 @@ func computeJobXfer(fromTo common.FromTo, blobType common.BlobType) newJobXfer {
 			case common.ELocation.File():
 				return newURLToAzureFileCopier
 			case common.ELocation.BlobFS():
-				panic(blobFSNotS2S)
+				return newURLToBlobCopier
 			default:
 				panic("unexpected target location type")
 			}
@@ -138,7 +135,7 @@ func computeJobXfer(fromTo common.FromTo, blobType common.BlobType) newJobXfer {
 		case common.ELocation.File():
 			return newFileSourceInfoProvider
 		case common.ELocation.BlobFS():
-			panic(blobFSNotS2S)
+			return newBlobSourceInfoProvider // Blob source info provider pulls info from blob and dfs
 		case common.ELocation.S3():
 			return newS3SourceInfoProvider
 		case common.ELocation.GCP():
@@ -149,11 +146,15 @@ func computeJobXfer(fromTo common.FromTo, blobType common.BlobType) newJobXfer {
 	}
 
 	// main computeJobXfer logic
-	switch {
-	case fromTo == common.EFromTo.BlobTrash():
+	switch fromTo {
+	case common.EFromTo.BlobTrash():
 		return DeleteBlob
-	case fromTo == common.EFromTo.FileTrash():
+	case common.EFromTo.FileTrash():
 		return DeleteFile
+	case common.EFromTo.BlobFSTrash():
+		return DeleteHNSResource
+	case common.EFromTo.BlobNone(), common.EFromTo.BlobFSNone(), common.EFromTo.FileNone():
+		return SetProperties
 	default:
 		if fromTo.IsDownload() {
 			return parameterizeDownload(remoteToLocal, getDownloader(fromTo.From()))
@@ -163,13 +164,13 @@ func computeJobXfer(fromTo common.FromTo, blobType common.BlobType) newJobXfer {
 	}
 }
 
-var inferExtensions = map[string]azblob.BlobType{
-	".vhd":  azblob.BlobPageBlob,
-	".vhdx": azblob.BlobPageBlob,
+var inferExtensions = map[string]blob.BlobType{
+	".vhd":  blob.BlobTypePageBlob,
+	".vhdx": blob.BlobTypePageBlob,
 }
 
 // infers a blob type from the extension specified.
-func inferBlobType(filename string, defaultBlobType azblob.BlobType) azblob.BlobType {
+func inferBlobType(filename string, defaultBlobType blob.BlobType) blob.BlobType {
 	if b, ok := inferExtensions[strings.ToLower(filepath.Ext(filename))]; ok {
 		return b
 	}

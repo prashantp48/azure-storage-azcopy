@@ -31,15 +31,15 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/minio/minio-go/pkg/s3utils"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-storage-azcopy/v10/jobsAdmin"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
-	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/Azure/azure-storage-file-go/azfile"
-
-	"github.com/Azure/azure-storage-azcopy/v10/azbfs"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/ste"
+	"github.com/minio/minio-go/pkg/s3utils"
 )
 
 var once sync.Once
@@ -57,11 +57,11 @@ const oauthLoginSessionCacheAccountName = "AzCopyOAuthTokenCache"
 // Note: Currently, only support to have TokenManager for one user mapping to one tenantID.
 func GetUserOAuthTokenManagerInstance() *common.UserOAuthTokenManager {
 	once.Do(func() {
-		if azcopyAppPathFolder == "" {
-			panic("invalid state, azcopyAppPathFolder should be initialized by root")
+		if common.AzcopyJobPlanFolder == "" {
+			panic("invalid state, AzcopyJobPlanFolder should not be an empty string")
 		}
 		currentUserOAuthTokenManager = common.NewUserOAuthTokenManagerInstance(common.CredCacheOptions{
-			DPAPIFilePath: azcopyAppPathFolder,
+			DPAPIFilePath: common.AzcopyJobPlanFolder,
 			KeyName:       oauthLoginSessionCacheKeyName,
 			ServiceName:   oauthLoginSessionCacheServiceName,
 			AccountName:   oauthLoginSessionCacheAccountName,
@@ -79,8 +79,14 @@ func GetOAuthTokenManagerInstance() (*common.UserOAuthTokenManager, error) {
 	var err error
 	autoOAuth.Do(func() {
 		var lca loginCmdArgs
-		if glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AutoLoginType()) == "" {
-			err = errors.New("no login type specified")
+		autoLoginType := strings.ToUpper(glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AutoLoginType()))
+		if autoLoginType == "" {
+			glcm.Info("Autologin not specified.")
+			return
+		}
+
+		if autoLoginType != "SPN" && autoLoginType != "MSI" && autoLoginType != "DEVICE" && autoLoginType != "AZCLI" && autoLoginType != "PSCRED" {
+			glcm.Error("Invalid Auto-login type specified.")
 			return
 		}
 
@@ -93,7 +99,7 @@ func GetOAuthTokenManagerInstance() (*common.UserOAuthTokenManager, error) {
 		}
 
 		// Fill up lca
-		switch glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AutoLoginType()) {
+		switch autoLoginType {
 		case "SPN":
 			lca.applicationID = glcm.GetEnvironmentVariable(common.EEnvironmentVariable.ApplicationID())
 			lca.certPath = glcm.GetEnvironmentVariable(common.EEnvironmentVariable.CertificatePath())
@@ -109,10 +115,24 @@ func GetOAuthTokenManagerInstance() (*common.UserOAuthTokenManager, error) {
 
 		case "DEVICE":
 			lca.identity = false
+
+		case "AZCLI":
+			lca.identity = false
+			lca.servicePrincipal = false
+			lca.psCred = false
+			lca.azCliCred = true
+
+		case "PSCRED":
+			lca.identity = false
+			lca.servicePrincipal = false
+			lca.azCliCred = false
+			lca.psCred = true
 		}
 
 		lca.persistToken = false
-		err = lca.process()
+		if err = lca.process(); err != nil {
+			glcm.Error(fmt.Sprintf("Failed to perform Auto-login: %v.", err.Error()))
+		}
 	})
 
 	if err != nil {
@@ -120,144 +140,6 @@ func GetOAuthTokenManagerInstance() (*common.UserOAuthTokenManager, error) {
 	}
 
 	return GetUserOAuthTokenManagerInstance(), nil
-}
-
-// ==============================================================================================
-// Get credential type methods
-// ==============================================================================================
-
-// getBlobCredentialType is used to get Blob's credential type when user wishes to use OAuth session mode.
-// The verification logic follows following rules:
-// 1. For source or dest url, if the url contains SAS or SAS is provided standalone, indicating using anonymous credential(SAS).
-// 2. If the blob URL can be public access resource, and validated as public resource, indicating using anonymous credential(public resource).
-// 3. If there is cached OAuth token, indicating using token credential.
-// 4. If there is OAuth token info passed from env var, indicating using token credential. (Note: this is only for testing)
-// 5. Otherwise use anonymous credential.
-// The implementation logic follows above rule, and adjusts sequence to save web request(for verifying public resource).
-func getBlobCredentialType(ctx context.Context, blobResourceURL string, canBePublic bool, standaloneSAS bool, cpkOptions common.CpkOptions) (common.CredentialType, bool, error) {
-	resourceURL, err := url.Parse(blobResourceURL)
-
-	if err != nil {
-		return common.ECredentialType.Unknown(), false, errors.New("provided blob resource string is not in URL format")
-	}
-
-	sas := azblob.NewBlobURLParts(*resourceURL).SAS
-
-	// If SAS existed, return anonymous credential type.
-	if isSASExisted := sas.Signature() != ""; isSASExisted || standaloneSAS {
-		return common.ECredentialType.Anonymous(), false, nil
-	}
-
-	checkPublic := func() (isPublicResource bool) {
-		if !canBePublic { // Cannot possibly be public - like say a destination EP
-			return false
-		}
-		p := azblob.NewPipeline(
-			azblob.NewAnonymousCredential(),
-			azblob.PipelineOptions{
-				Retry: azblob.RetryOptions{
-					Policy:        azblob.RetryPolicyExponential,
-					MaxTries:      ste.UploadMaxTries,
-					TryTimeout:    ste.UploadTryTimeout,
-					RetryDelay:    ste.UploadRetryDelay,
-					MaxRetryDelay: ste.UploadMaxRetryDelay,
-				},
-				RequestLog: azblob.RequestLogOptions{
-					SyslogDisabled: common.IsForceLoggingDisabled(),
-				},
-			})
-
-		isContainer := copyHandlerUtil{}.urlIsContainerOrVirtualDirectory(resourceURL)
-		isPublicResource = false
-
-		// Scenario 1: When resourceURL points to a container
-		// Scenario 2: When resourceURL points to a virtual directory.
-		// Check if the virtual directory is accessible by doing GetProperties on container.
-		// Virtual directory can be accessed/scanned only when its parent container is public.
-		bURLParts := azblob.NewBlobURLParts(*resourceURL)
-		bURLParts.BlobName = ""
-		containerURL := azblob.NewContainerURL(bURLParts.URL(), p)
-
-		if bURLParts.ContainerName == "" || strings.Contains(bURLParts.ContainerName, "*") {
-			// Service level searches can't possibly be public.
-			return false
-		}
-
-		if _, err := containerURL.GetProperties(ctx, azblob.LeaseAccessConditions{}); err == nil {
-			return true
-		}
-
-		if !isContainer {
-			clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-			if cpkOptions.IsSourceEncrypted {
-				clientProvidedKey = common.GetClientProvidedKey(cpkOptions)
-			}
-			// Scenario 3: When resourceURL points to a blob
-			blobURL := azblob.NewBlobURL(*resourceURL, p)
-			if _, err := blobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, clientProvidedKey); err == nil {
-				return true
-			}
-		}
-
-		return
-	}
-
-	// If SAS token doesn't exist, it could be using OAuth token or the resource is public.
-	if !oAuthTokenExists() { // no oauth token found, then directly return anonymous credential
-		isPublicResource := checkPublic()
-
-		// No forms of auth are present.no SAS token or OAuth token is present and the resource is not public
-		if !isPublicResource {
-			return common.ECredentialType.Unknown(), isPublicResource,
-				common.NewAzError(common.EAzError.LoginCredMissing(), "No SAS token or OAuth token is present and the resource is not public")
-		}
-
-		return common.ECredentialType.Anonymous(), isPublicResource, nil
-	} else if !canBePublic { // oauth token found, if it can not be public resource, return token credential
-		return common.ECredentialType.OAuthToken(), false, nil
-	} else { // check if it's public resource, and return credential type correspondingly
-		// If has cached token, and no SAS token provided, it could be a public blob resource.
-		isPublicResource := checkPublic()
-
-		if isPublicResource {
-			return common.ECredentialType.Anonymous(), true, nil
-		} else {
-			return common.ECredentialType.OAuthToken(), false, nil
-		}
-	}
-}
-
-// getBlobFSCredentialType is used to get BlobFS's credential type when user wishes to use OAuth session mode.
-// The verification logic follows following rules:
-// 1. Check if there is a SAS query appended to the URL
-// 2. If there is cached session OAuth token, indicating using token credential.
-// 3. If there is OAuth token info passed from env var, indicating using token credential. (Note: this is only for testing)
-// 4. Otherwise use shared key.
-func getBlobFSCredentialType(ctx context.Context, blobResourceURL string, standaloneSAS bool) (common.CredentialType, error) {
-	resourceURL, err := url.Parse(blobResourceURL)
-	if err != nil {
-		return common.ECredentialType.Unknown(), err
-	}
-
-	//Give preference to explicitly supplied SAS tokens
-	sas := azbfs.NewBfsURLParts(*resourceURL).SAS
-
-	if isSASExisted := sas.Signature() != ""; isSASExisted || standaloneSAS {
-		return common.ECredentialType.Anonymous(), nil
-	}
-
-	if oAuthTokenExists() {
-		return common.ECredentialType.OAuthToken(), nil
-	}
-
-	name := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AccountName())
-	key := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AccountKey())
-	if name != "" && key != "" { // TODO: To remove, use for internal testing, SharedKey should not be supported from commandline
-		return common.ECredentialType.SharedKey(), nil
-	} else {
-		return common.ECredentialType.Unknown(),
-			common.NewAzError(common.EAzError.LoginCredMissing(), "OAuth token, SAS token, or shared key should be provided for Blob FS")
-	}
 }
 
 var announceOAuthTokenOnce sync.Once
@@ -274,10 +156,15 @@ func oAuthTokenExists() (oauthTokenExists bool) {
 		oauthTokenExists = true
 	}
 
-	uotm := GetUserOAuthTokenManagerInstance()
+	uotm, err := GetOAuthTokenManagerInstance()
+	if err != nil {
+		oauthTokenExists = false
+		return
+	}
+
 	if hasCachedToken, err := uotm.HasCachedToken(); hasCachedToken {
 		oauthTokenExists = true
-	} else if err != nil {
+	} else if err != nil { //nolint:staticcheck
 		// Log the error if fail to get cached token, as these are unhandled errors, and should not influence the logic flow.
 		// Uncomment for debugging.
 		// glcm.Info(fmt.Sprintf("No cached token found, %v", err))
@@ -285,16 +172,6 @@ func oAuthTokenExists() (oauthTokenExists bool) {
 
 	return
 }
-
-// getAzureFileCredentialType is used to get Azure file's credential type
-func getAzureFileCredentialType() (common.CredentialType, error) {
-	// Azure file only support anonymous credential currently.
-	return common.ECredentialType.Anonymous(), nil
-}
-
-// envVarCredentialType used for passing credential type into AzCopy through environment variable.
-// Note: This is only used for internal integration, and not encouraged to be used directly.
-const envVarCredentialType = "AZCOPY_CRED_TYPE"
 
 var stashedEnvCredType = ""
 
@@ -367,6 +244,7 @@ func checkAuthSafeForTarget(ct common.CredentialType, resource, extraSuffixesAAD
 		// these auth types don't pick up anything from environment vars, so they are not the focus of this routine
 		return nil
 	case common.ECredentialType.OAuthToken(),
+		common.ECredentialType.MDOAuthToken(),
 		common.ECredentialType.SharedKey():
 		// Files doesn't currently support OAuth, but it's a valid azure endpoint anyway, so it'll pass the check.
 		if resourceType != common.ELocation.Blob() && resourceType != common.ELocation.BlobFS() && resourceType != common.ELocation.File() {
@@ -404,7 +282,7 @@ func checkAuthSafeForTarget(ct common.CredentialType, resource, extraSuffixesAAD
 		// something like https://someApi.execute-api.someRegion.amazonaws.com is AWS but is a customer-
 		// written code, not S3.
 		ok := false
-		host := "<unparseable url>"
+		host := "<unparsable url>"
 		u, err := url.Parse(resource)
 		if err == nil {
 			host = u.Host
@@ -417,17 +295,16 @@ func checkAuthSafeForTarget(ct common.CredentialType, resource, extraSuffixesAAD
 
 		if !ok {
 			return fmt.Errorf(
-				"s3 authentication to %s is not currently suported in AzCopy", host)
+				"s3 authentication to %s is not currently supported in AzCopy", host)
 		}
 	case common.ECredentialType.GoogleAppCredentials():
 		if resourceType != common.ELocation.GCP() {
 			return fmt.Errorf("Google Application Credentials to %s is not valid", resourceType.String())
 		}
 
-		host := "<unparseable url>"
 		u, err := url.Parse(resource)
 		if err == nil {
-			host = u.Host
+			host := u.Host
 			_, err := common.NewGCPURLParts(*u)
 			if err != nil {
 				return fmt.Errorf("GCP authentication to %s is not currently supported", host)
@@ -456,12 +333,14 @@ func logAuthType(ct common.CredentialType, location common.Location, isSource bo
 	name := ct.String()
 	if ct == common.ECredentialType.OAuthToken() {
 		name = "Azure AD" // clarify the name to something users will recognize
+	} else if ct == common.ECredentialType.MDOAuthToken() {
+		name = "Azure AD (Managed Disk)"
 	}
 	message := fmt.Sprintf("Authenticating to %s using %s", resource, name)
 	if _, exists := authMessagesAlreadyLogged.Load(message); !exists {
 		authMessagesAlreadyLogged.Store(message, struct{}{}) // dedup because source is auth'd by both enumerator and STE
-		if ste.JobsAdmin != nil {
-			ste.JobsAdmin.LogToJobLog(message, pipeline.LogInfo)
+		if jobsAdmin.JobsAdmin != nil {
+			jobsAdmin.JobsAdmin.LogToJobLog(message, common.LogInfo)
 		}
 		glcm.Info(message)
 	}
@@ -469,67 +348,180 @@ func logAuthType(ct common.CredentialType, location common.Location, isSource bo
 
 var authMessagesAlreadyLogged = &sync.Map{}
 
+// isPublic reports true if the Blob URL passed can be read without auth.
+func isPublic(ctx context.Context, blobResourceURL string, cpkOptions common.CpkOptions) (isPublicResource bool) {
+	bURLParts, err := blob.ParseURL(blobResourceURL)
+	if err != nil {
+		return false;
+	}
+
+	if bURLParts.ContainerName == "" || strings.Contains(bURLParts.ContainerName, "*") {
+		// Service level searches can't possibly be public.
+		return false
+	}
+
+	// This request will not be logged. This can fail, and too many Cx do not like this. 
+	clientOptions := ste.NewClientOptions(policy.RetryOptions{
+		MaxRetries:    ste.UploadMaxTries,
+		TryTimeout:    ste.UploadTryTimeout,
+		RetryDelay:    ste.UploadRetryDelay,
+		MaxRetryDelay: ste.UploadMaxRetryDelay,
+	}, policy.TelemetryOptions{
+		ApplicationID: glcm.AddUserAgentPrefix(common.UserAgent),
+	}, nil, nil, ste.LogOptions{}, nil)
+
+	blobClient, _ := blob.NewClientWithNoCredential(bURLParts.String(), &blob.ClientOptions{ClientOptions: clientOptions})
+	bURLParts.BlobName = ""
+	bURLParts.Snapshot = ""
+	bURLParts.VersionID = ""
+
+	// Scenario 1: When resourceURL points to a container or a virtual directory
+	// Check if the virtual directory is accessible by doing GetProperties on container.
+	// Virtual directory can be public only when its parent container is public.
+	containerClient, _ := container.NewClientWithNoCredential(bURLParts.String(), &container.ClientOptions{ClientOptions: clientOptions})
+	if _, err := containerClient.GetProperties(ctx, nil); err == nil {
+		return true
+	}
+
+	// Scenario 2: When resourceURL points to a blob
+	if _, err := blobClient.GetProperties(ctx, &blob.GetPropertiesOptions{CPKInfo: cpkOptions.GetCPKInfo()}); err == nil {
+		return true
+	}
+
+	return false
+}
+
+// mdAccountNeedsOAuth pings the passed in md account, and checks if we need additional token with Disk-socpe
+func mdAccountNeedsOAuth(ctx context.Context, blobResourceURL string, cpkOptions common.CpkOptions) bool {
+	// This request will not be logged. This can fail, and too many Cx do not like this. 
+	clientOptions := ste.NewClientOptions(policy.RetryOptions{
+		MaxRetries:    ste.UploadMaxTries,
+		TryTimeout:    ste.UploadTryTimeout,
+		RetryDelay:    ste.UploadRetryDelay,
+		MaxRetryDelay: ste.UploadMaxRetryDelay,
+	}, policy.TelemetryOptions{
+		ApplicationID: glcm.AddUserAgentPrefix(common.UserAgent),
+	}, nil, nil, ste.LogOptions{}, nil)
+
+	blobClient, _ := blob.NewClientWithNoCredential(blobResourceURL, &blob.ClientOptions{ClientOptions: clientOptions})
+	_, err := blobClient.GetProperties(ctx, &blob.GetPropertiesOptions{CPKInfo: cpkOptions.GetCPKInfo()})
+	if err == nil {
+		return false
+	}
+
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) {
+		if respErr.StatusCode == 401 || respErr.StatusCode == 403 { // *sometimes* the service can return 403s.
+			challenge := respErr.RawResponse.Header.Get("WWW-Authenticate")
+			if strings.Contains(challenge, common.MDResource) {
+				return true;
+			}
+		}
+	}
+	return false
+}
+
 func getCredentialTypeForLocation(ctx context.Context, location common.Location, resource, resourceSAS string, isSource bool, cpkOptions common.CpkOptions) (credType common.CredentialType, isPublic bool, err error) {
 	return doGetCredentialTypeForLocation(ctx, location, resource, resourceSAS, isSource, GetCredTypeFromEnvVar, cpkOptions)
 }
 
-func doGetCredentialTypeForLocation(ctx context.Context, location common.Location, resource, resourceSAS string, isSource bool, getForcedCredType func() common.CredentialType, cpkOptions common.CpkOptions) (credType common.CredentialType, isPublic bool, err error) {
-	if resourceSAS != "" {
-		credType = common.ECredentialType.Anonymous()
-	} else if credType = getForcedCredType(); credType == common.ECredentialType.Unknown() || location == common.ELocation.S3() || location == common.ELocation.GCP() {
-		switch location {
-		case common.ELocation.Local(), common.ELocation.Benchmark():
+func doGetCredentialTypeForLocation(ctx context.Context, location common.Location, resource, resourceSAS string, isSource bool, getForcedCredType func() common.CredentialType, cpkOptions common.CpkOptions) (credType common.CredentialType, public bool, err error) {
+	public = false
+	err = nil
+
+	switch location {
+	case common.ELocation.Local(), common.ELocation.Benchmark(), common.ELocation.None(), common.ELocation.Pipe():
+		return common.ECredentialType.Anonymous(), false, nil
+	}
+	
+	defer func() { 
+		logAuthType(credType, location, isSource) 
+	}()
+
+	// caution: If auth-type is unsafe, below defer statement will change the return value credType
+	defer func() {
+		if err != nil {
+			return
+		}
+
+		if err = checkAuthSafeForTarget(credType, resource, cmdLineExtraSuffixesAAD, location); err != nil {
+			credType = common.ECredentialType.Unknown()
+			public = false
+		}
+	}()
+
+	if getForcedCredType() != common.ECredentialType.Unknown() &&
+			location != common.ELocation.S3() && location != common.ELocation.GCP() {
+				credType = getForcedCredType()
+				return
+	}
+	
+	if location == common.ELocation.S3() {
+		accessKeyID := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AWSAccessKeyID())
+		secretAccessKey := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AWSSecretAccessKey())
+		if accessKeyID == "" || secretAccessKey == "" {
+			credType = common.ECredentialType.S3PublicBucket()
+			public = true
+			return
+		}
+
+		credType = common.ECredentialType.S3AccessKey()
+		return
+	}
+	
+	if location == common.ELocation.GCP() {
+		googleAppCredentials := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.GoogleAppCredentials())
+		if googleAppCredentials == "" {
+			return common.ECredentialType.Unknown(), false, errors.New("GOOGLE_APPLICATION_CREDENTIALS environment variable must be set before using GCP transfer feature")
+		}
+		credType = common.ECredentialType.GoogleAppCredentials()
+		return
+	}
+
+	// Special blob destinations - public and MD account needing oAuth
+	if location == common.ELocation.Blob() {
+		if isSource && resourceSAS == "" && isPublic(ctx, resource, cpkOptions) {
 			credType = common.ECredentialType.Anonymous()
-		case common.ELocation.Blob():
-			credType, isPublic, err = getBlobCredentialType(ctx, resource, isSource, resourceSAS != "", cpkOptions)
-			if azErr, ok := err.(common.AzError); ok && azErr.Equals(common.EAzError.LoginCredMissing()) {
-				_, autoLoginErr := GetOAuthTokenManagerInstance()
-				if autoLoginErr == nil {
-					err = nil // Autologin succeeded, reset original error
-					credType, isPublic = common.ECredentialType.OAuthToken(), false
-				}
+			public = true
+			return
+		}
+
+		uri, _ := url.Parse(resource)
+		if strings.HasPrefix(uri.Host, "md-") && mdAccountNeedsOAuth(ctx, resource, cpkOptions) {
+			if !oAuthTokenExists() {
+				return common.ECredentialType.Unknown(), false,
+					common.NewAzError(common.EAzError.LoginCredMissing(), "No SAS token or OAuth token is present and the resource is not public")
 			}
-			if err != nil {
-				return common.ECredentialType.Unknown(), false, err
-			}
-		case common.ELocation.File():
-			if credType, err = getAzureFileCredentialType(); err != nil {
-				return common.ECredentialType.Unknown(), false, err
-			}
-		case common.ELocation.BlobFS():
-			credType, err = getBlobFSCredentialType(ctx, resource, resourceSAS != "")
-			if azErr, ok := err.(common.AzError); ok && azErr.Equals(common.EAzError.LoginCredMissing()) {
-				_, autoLoginErr := GetOAuthTokenManagerInstance()
-				if autoLoginErr == nil {
-					err = nil // Autologin succeeded, reset original error
-					credType, isPublic = common.ECredentialType.OAuthToken(), false
-				}
-			}
-			if err != nil {
-				return common.ECredentialType.Unknown(), false, err
-			}
-		case common.ELocation.S3():
-			accessKeyID := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AWSAccessKeyID())
-			secretAccessKey := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AWSSecretAccessKey())
-			if accessKeyID == "" || secretAccessKey == "" {
-				credType = common.ECredentialType.S3PublicBucket()
-				return credType, true, nil
-			}
-			credType = common.ECredentialType.S3AccessKey()
-		case common.ELocation.GCP():
-			googleAppCredentials := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.GoogleAppCredentials())
-			if googleAppCredentials == "" {
-				return common.ECredentialType.Unknown(), false, errors.New("GOOGLE_APPLICATION_CREDENTIALS environment variable must be set before using GCP transfer feature")
-			}
-			credType = common.ECredentialType.GoogleAppCredentials()
+
+			credType = common.ECredentialType.MDOAuthToken()
+			return
 		}
 	}
 
-	if err = checkAuthSafeForTarget(credType, resource, cmdLineExtraSuffixesAAD, location); err != nil {
-		return common.ECredentialType.Unknown(), false, err
+	if resourceSAS != "" {
+		credType = common.ECredentialType.Anonymous()
+		return
 	}
 
-	logAuthType(credType, location, isSource)
+	if oAuthTokenExists() {
+		credType = common.ECredentialType.OAuthToken()
+		return
+	}
+
+	// BlobFS currently supports Shared key. Remove this piece of code, once
+	// we deprecate that.
+	if location == common.ELocation.BlobFS() {
+		name := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AccountName())
+		key := glcm.GetEnvironmentVariable(common.EEnvironmentVariable.AccountKey())
+		if name != "" && key != "" { // TODO: To remove, use for internal testing, SharedKey should not be supported from commandline
+			credType = common.ECredentialType.SharedKey()
+		}
+	}
+
+	// We may not always use the OAuth token on Managed Disks. As such, we should change to the type indicating the potential for use.
+	// if mdAccount && credType == common.ECredentialType.OAuthToken() {
+	// 	credType = common.ECredentialType.MDOAuthToken()
+	// }
 	return
 }
 
@@ -539,7 +531,7 @@ func GetCredentialInfoForLocation(ctx context.Context, location common.Location,
 	credInfo.CredentialType, isPublic, err = getCredentialTypeForLocation(ctx, location, resource, resourceSAS, isSource, cpkOptions)
 
 	// flesh out the rest of the fields, for those types that require it
-	if credInfo.CredentialType == common.ECredentialType.OAuthToken() {
+	if credInfo.CredentialType.IsAzureOAuth() {
 		uotm := GetUserOAuthTokenManagerInstance()
 
 		if tokenInfo, err := uotm.GetTokenInfo(ctx); err != nil {
@@ -547,9 +539,6 @@ func GetCredentialInfoForLocation(ctx context.Context, location common.Location,
 		} else {
 			credInfo.OAuthTokenInfo = *tokenInfo
 		}
-	} else if credInfo.CredentialType == common.ECredentialType.S3AccessKey() || credInfo.CredentialType == common.ECredentialType.S3PublicBucket() {
-		// nothing to do here. The extra fields for S3 are fleshed out at the time
-		// we make the S3Client
 	}
 
 	return
@@ -587,105 +576,25 @@ func getCredentialType(ctx context.Context, raw rawFromToInfo, cpkOptions common
 // ==============================================================================================
 // pipeline factory methods
 // ==============================================================================================
-func createBlobPipeline(ctx context.Context, credInfo common.CredentialInfo, logLevel pipeline.LogLevel) (pipeline.Pipeline, error) {
-	credential := common.CreateBlobCredential(ctx, credInfo, common.CredentialOpOptions{
-		//LogInfo:  glcm.Info, //Comment out for debugging
-		LogError: glcm.Info,
-	})
+// createClientOptions creates generic client options which are required to create any
+// client to interact with storage service. Default options are modified to suit azcopy.
+// srcCred is required in cases where source is authenticated via oAuth for S2S transfers
+func createClientOptions(logger common.ILoggerResetable, srcCred *common.ScopedCredential) azcore.ClientOptions {
+	logOptions := ste.LogOptions{}
 
-	logOption := pipeline.LogOptions{}
-	if azcopyScanningLogger != nil {
-		logOption = pipeline.LogOptions{
-			Log:       azcopyScanningLogger.Log,
-			ShouldLog: func(level pipeline.LogLevel) bool { return level <= logLevel },
-		}
+	if logger != nil {
+		logOptions.RequestLogOptions.SyslogDisabled = common.IsForceLoggingDisabled()
+		logOptions.Log = logger.Log
+		logOptions.ShouldLog = logger.ShouldLog
 	}
-
-	return ste.NewBlobPipeline(
-		credential,
-		azblob.PipelineOptions{
-			Telemetry: azblob.TelemetryOptions{
-				Value: glcm.AddUserAgentPrefix(common.UserAgent),
-			},
-			Log: logOption,
-		},
-		ste.XferRetryOptions{
-			Policy:        0,
-			MaxTries:      ste.UploadMaxTries,
-			TryTimeout:    ste.UploadTryTimeout,
-			RetryDelay:    ste.UploadRetryDelay,
-			MaxRetryDelay: ste.UploadMaxRetryDelay,
-		},
-		nil,
-		ste.NewAzcopyHTTPClient(frontEndMaxIdleConnectionsPerHost),
-		nil, // we don't gather network stats on the credential pipeline
-	), nil
+	return ste.NewClientOptions(policy.RetryOptions{
+		MaxRetries:    ste.UploadMaxTries,
+		TryTimeout:    ste.UploadTryTimeout,
+		RetryDelay:    ste.UploadRetryDelay,
+		MaxRetryDelay: ste.UploadMaxRetryDelay,
+	}, policy.TelemetryOptions{
+		ApplicationID: glcm.AddUserAgentPrefix(common.UserAgent),
+	}, ste.NewAzcopyHTTPClient(frontEndMaxIdleConnectionsPerHost), nil, logOptions, srcCred)
 }
 
 const frontEndMaxIdleConnectionsPerHost = http.DefaultMaxIdleConnsPerHost
-
-func createBlobFSPipeline(ctx context.Context, credInfo common.CredentialInfo, logLevel pipeline.LogLevel) (pipeline.Pipeline, error) {
-	credential := common.CreateBlobFSCredential(ctx, credInfo, common.CredentialOpOptions{
-		//LogInfo:  glcm.Info, //Comment out for debugging
-		LogError: glcm.Info,
-	})
-
-	logOption := pipeline.LogOptions{}
-	if azcopyScanningLogger != nil {
-		logOption = pipeline.LogOptions{
-			Log:       azcopyScanningLogger.Log,
-			ShouldLog: func(level pipeline.LogLevel) bool { return level <= logLevel },
-		}
-	}
-
-	return ste.NewBlobFSPipeline(
-		credential,
-		azbfs.PipelineOptions{
-			Telemetry: azbfs.TelemetryOptions{
-				Value: glcm.AddUserAgentPrefix(common.UserAgent),
-			},
-			Log: logOption,
-		},
-		ste.XferRetryOptions{
-			Policy:        0,
-			MaxTries:      ste.UploadMaxTries,
-			TryTimeout:    ste.UploadTryTimeout,
-			RetryDelay:    ste.UploadRetryDelay,
-			MaxRetryDelay: ste.UploadMaxRetryDelay,
-		},
-		nil,
-		ste.NewAzcopyHTTPClient(frontEndMaxIdleConnectionsPerHost),
-		nil, // we don't gather network stats on the credential pipeline
-	), nil
-}
-
-// TODO note: ctx and credInfo are ignored at the moment because we only support SAS for Azure File
-func createFilePipeline(ctx context.Context, credInfo common.CredentialInfo, logLevel pipeline.LogLevel) (pipeline.Pipeline, error) {
-	logOption := pipeline.LogOptions{}
-	if azcopyScanningLogger != nil {
-		logOption = pipeline.LogOptions{
-			Log:       azcopyScanningLogger.Log,
-			ShouldLog: func(level pipeline.LogLevel) bool { return level <= logLevel },
-		}
-	}
-
-	return ste.NewFilePipeline(
-		azfile.NewAnonymousCredential(),
-		azfile.PipelineOptions{
-			Telemetry: azfile.TelemetryOptions{
-				Value: glcm.AddUserAgentPrefix(common.UserAgent),
-			},
-			Log: logOption,
-		},
-		azfile.RetryOptions{
-			Policy:        azfile.RetryPolicyExponential,
-			MaxTries:      ste.UploadMaxTries,
-			TryTimeout:    ste.UploadTryTimeout,
-			RetryDelay:    ste.UploadRetryDelay,
-			MaxRetryDelay: ste.UploadMaxRetryDelay,
-		},
-		nil,
-		ste.NewAzcopyHTTPClient(frontEndMaxIdleConnectionsPerHost),
-		nil, // we don't gather network stats on the credential pipeline
-	), nil
-}

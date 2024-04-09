@@ -21,7 +21,7 @@
 package e2etest
 
 import (
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"reflect"
 	"strings"
 	"testing"
@@ -30,11 +30,11 @@ import (
 	"github.com/JeffreyRichter/enum/enum"
 )
 
-///////////
+// /////////
 
 var sanitizer = common.NewAzCopyLogSanitizer() // while this is "only tests", we may as well follow good SAS redaction practices
 
-////////
+// //////
 
 type comparison struct {
 	equals bool
@@ -52,12 +52,11 @@ func equals() comparison {
 	return comparison{true}
 }
 
-//nolint
 func notEquals() comparison {
 	return comparison{false}
 }
 
-///////
+// /////
 
 // simplified assertion interface. Allows us to abstract away the specific test harness we are using
 // (in case we change it... again)
@@ -116,7 +115,7 @@ func (a *testingAsserter) AssertNoErr(err error, comment ...string) {
 		a.t.Helper() // exclude this method from the logged callstack
 		redactedErr := sanitizer.SanitizeLogMessage(err.Error())
 		a.t.Logf("Error %s%s", redactedErr, a.formatComments(comment))
-		a.t.FailNow()
+		a.t.Fail()
 	}
 }
 
@@ -137,7 +136,7 @@ func (a *testingAsserter) CompactScenarioName() string {
 	return a.compactScenarioName
 }
 
-////
+// //
 
 type params struct {
 	recursive                 bool
@@ -149,15 +148,17 @@ type params struct {
 	excludePath               string
 	excludePattern            string
 	excludeAttributes         string
+	forceIfReadOnly           bool
 	capMbps                   float32
 	blockSizeMB               float32
-	deleteDestination         common.DeleteDestination
+	deleteDestination         common.DeleteDestination // Manual validation is needed.
 	s2sSourceChangeValidation bool
 	metadata                  string
 	cancelFromStdin           bool
 	backupMode                bool
 	preserveSMBPermissions    bool
-	preserveSMBInfo           bool
+	preserveSMBInfo           *bool
+	preservePOSIXProperties   bool
 	relativeSourcePath        string
 	blobTags                  string
 	blobType                  string
@@ -168,9 +169,19 @@ type params struct {
 	isObjectDir               bool
 	debugSkipFiles            []string // a list of localized filepaths to skip over on the first run in the STE.
 	s2sPreserveAccessTier     bool
-	accessTier                azblob.AccessTierType
+	accessTier                *blob.AccessTier
+	checkMd5                  common.HashValidationOption
+	compareHash               common.SyncHashType
+	hashStorageMode           common.HashStorageMode
+	hashStorageDir            string
+	symlinkHandling           common.SymlinkHandlingType
+
+	destNull bool
 
 	disableParallelTesting bool
+	deleteDestinationFile bool
+	trailingDot common.TrailingDotOption
+	decompress  bool
 	// looks like this for a folder transfer:
 	/*
 		INFO: source: /New folder/New Text Document.txt dest: /Test/New folder/New Text Document.txt
@@ -180,15 +191,23 @@ type params struct {
 	/*
 		INFO: source:  dest: /New Text Document.txt
 	*/
+
+	// cancel params
+	ignoreErrorIfCompleted bool
+
+	// benchmark params
+	mode        string
+	fileCount   int
+	sizePerFile string
 }
 
 // we expect folder transfers to be allowed (between folder-aware resources) if there are no filters that act at file level
 // TODO : Make this *actually* check with azcopy code instead of assuming azcopy's black magic.
 func (p params) allowsFolderTransfers() bool {
-	return p.includePattern+p.includeAttributes+p.excludePattern+p.excludeAttributes == ""
+	return !p.destNull && p.includePattern+p.includeAttributes+p.excludePattern+p.excludeAttributes == ""
 }
 
-//////////////
+// ////////////
 
 var eOperation = Operation(0)
 
@@ -199,6 +218,8 @@ func (Operation) Sync() Operation        { return Operation(1 << 1) }
 func (Operation) CopyAndSync() Operation { return eOperation.Copy() | eOperation.Sync() }
 func (Operation) Remove() Operation      { return Operation(1 << 2) }
 func (Operation) Resume() Operation      { return Operation(1 << 7) } // Resume should only ever be combined with Copy or Sync, and is a mid-job cancel/resume.
+func (Operation) Cancel() Operation      { return Operation(1 << 3) }
+func (Operation) Benchmark() Operation   { return Operation(1 << 4) }
 
 func (o Operation) String() string {
 	return enum.StringInt(o, reflect.TypeOf(o))
@@ -227,7 +248,7 @@ func (o Operation) includes(item Operation) bool {
 	return false
 }
 
-/////////////
+// ///////////
 
 var eTestFromTo = TestFromTo{}
 
@@ -351,11 +372,13 @@ func (TestFromTo) AllSync() TestFromTo {
 			common.ELocation.Blob(),
 			common.ELocation.File(),
 			common.ELocation.Local(),
+			common.ELocation.BlobFS(),
 		},
 		tos: []common.Location{
 			common.ELocation.Blob(),
 			common.ELocation.File(),
 			common.ELocation.Local(),
+			common.ELocation.BlobFS(),
 		},
 	}
 }
@@ -466,7 +489,7 @@ func (tft TestFromTo) getValues(op Operation) []common.FromTo {
 	return result
 }
 
-////
+// //
 
 var eValidate = Validate(0)
 
@@ -484,7 +507,7 @@ func (v Validate) String() string {
 	return enum.StringInt(v, reflect.TypeOf(v))
 }
 
-//////
+// ////
 
 // hookHelper is functions that hooks can call to influence test execution
 // NOTE: this interface will have to actively evolve as we discover what we need our hooks to do.
@@ -499,6 +522,9 @@ type hookHelper interface {
 
 	// GetTestFiles returns (a copy of) the testFiles object that defines which files will be used in the test
 	GetTestFiles() testFiles
+
+	// SetTestFiles allows the test to set the test files in a callback (e.g. adding new files to the test dynamically w/o creation)
+	SetTestFiles(fs testFiles)
 
 	// CreateFiles creates the specified files (overwriting any that are already there of the same name)
 	CreateFiles(fs testFiles, atSource bool, setTestFiles bool, createSourceFilesAtDest bool)
@@ -521,9 +547,12 @@ type hookHelper interface {
 
 	// GetDestination returns the destination Resource Manager
 	GetDestination() resourceManager
+
+	// GetSource returns the source Resource Manager
+	GetSource() resourceManager
 }
 
-///////
+// /////
 
 type hookFunc func(h hookHelper)
 

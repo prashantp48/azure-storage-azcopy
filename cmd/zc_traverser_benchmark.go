@@ -45,8 +45,8 @@ func newBenchmarkTraverser(source string, incrementEnumerationCounter enumeratio
 		nil
 }
 
-func (t *benchmarkTraverser) IsDirectory(bool) bool {
-	return true
+func (t *benchmarkTraverser) IsDirectory(bool) (bool, error) {
+	return true, nil
 }
 
 func (_ *benchmarkTraverser) toReversedString(i uint) string {
@@ -89,7 +89,7 @@ func (t *benchmarkTraverser) Traverse(preprocessor objectMorpher, processor obje
 			t.bytesPerFile,
 			noContentProps,
 			noBlobProps,
-			noMetdata,
+			noMetadata,
 			""), processor)
 		_, err = getProcessingError(err)
 		if err != nil {

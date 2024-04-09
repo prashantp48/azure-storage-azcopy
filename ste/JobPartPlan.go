@@ -2,18 +2,18 @@ package ste
 
 import (
 	"errors"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"reflect"
 	"sync/atomic"
 	"unsafe"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 // dataSchemaVersion defines the data schema version of JobPart order files supported by
 // current version of azcopy
 // To be Incremented every time when we release azcopy with changed dataSchema
-const DataSchemaVersion common.Version = 16
+const DataSchemaVersion common.Version = 18
 
 const (
 	CustomHeaderMaxBytes = 256
@@ -21,7 +21,7 @@ const (
 	BlobTagsMaxByte      = 4000
 )
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 type JobPartPlanMMF common.MMF
 
@@ -32,8 +32,20 @@ func (mmf *JobPartPlanMMF) Plan() *JobPartPlanHeader {
 }
 func (mmf *JobPartPlanMMF) Unmap() { (*common.MMF)(mmf).Unmap() }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+type IJobPartPlanHeader interface {
+	CommandString() string
+	GetRelativeSrcDstStrings(transferIndex uint32) (source string, destination string)
+	JobPartStatus() common.JobStatus
+	JobStatus() common.JobStatus
+	SetJobPartStatus(newJobStatus common.JobStatus)
+	SetJobStatus(newJobStatus common.JobStatus)
+	Transfer(transferIndex uint32) *JobPartPlanTransfer
+	TransferSrcDstRelatives(transferIndex uint32) (relSource string, relDest string)
+	TransferSrcDstStrings(transferIndex uint32) (source string, destination string, isFolder bool)
+	TransferSrcPropertiesAndMetadata(transferIndex uint32) (h common.ResourceHTTPHeaders, metadata common.Metadata, blobType blob.BlobType, blobTier blob.AccessTier, s2sGetPropertiesInBackend bool, DestLengthValidation bool, s2sSourceChangeValidation bool, s2sInvalidMetadataHandleOption common.InvalidMetadataHandleOption, entityType common.EntityType, blobVersionID string, blobSnapshotID string, blobTags common.BlobTags)
+}
 // JobPartPlanHeader represents the header of Job Part's memory-mapped file
 type JobPartPlanHeader struct {
 	// Once set, the following fields are constants; they should never be modified
@@ -62,9 +74,11 @@ type JobPartPlanHeader struct {
 	LogLevel               common.LogLevel     // This Job Part's minimal log level
 	DstBlobData            JobPartPlanDstBlob  // Additional data for blob destinations
 	DstLocalData           JobPartPlanDstLocal // Additional data for local destinations
+	DstFileData            JobPartPlanDstFile  // Additional data for file destinations
 
-	PreservePermissions common.PreservePermissionsOption
-	PreserveSMBInfo     bool
+	PreservePermissions     common.PreservePermissionsOption
+	PreserveSMBInfo         bool
+	PreservePOSIXProperties bool
 	// S2SGetPropertiesInBackend represents whether to enable get S3 objects' or Azure files' properties during s2s copy in backend.
 	S2SGetPropertiesInBackend bool
 	// S2SSourceChangeValidation represents whether user wants to check if source has changed after enumerating.
@@ -73,6 +87,8 @@ type JobPartPlanHeader struct {
 	DestLengthValidation bool
 	// S2SInvalidMetadataHandleOption represents how user wants to handle invalid metadata.
 	S2SInvalidMetadataHandleOption common.InvalidMetadataHandleOption
+	// BlobFSRecursiveDelete represents whether the user wants to make a recursive call to the DFS endpoint or not
+	BlobFSRecursiveDelete bool
 
 	// Any fields below this comment are NOT constants; they may change over as the job part is processed.
 	// Care must be taken to read/write to these fields in a thread-safe way!
@@ -80,13 +96,16 @@ type JobPartPlanHeader struct {
 	// jobStatus_doNotUse represents the current status of JobPartPlan
 	// jobStatus_doNotUse is a private member whose value can be accessed by Status and SetJobStatus
 	// jobStatus_doNotUse should not be directly accessed anywhere except by the Status and SetJobStatus
-	atomicJobStatus common.JobStatus
+	atomicJobStatus  common.JobStatus
+	atomicPartStatus common.JobStatus
 
 	// For delete operation specify what to do with snapshots
 	DeleteSnapshotsOption common.DeleteSnapshotsOption
 
 	// Determine what to do with soft-deleted snapshots
 	PermanentDeleteOption common.PermanentDeleteOption
+
+	RehydratePriority common.RehydratePriorityType
 }
 
 // Status returns the job status stored in JobPartPlanHeader in thread-safe manner
@@ -97,6 +116,14 @@ func (jpph *JobPartPlanHeader) JobStatus() common.JobStatus {
 // SetJobStatus sets the job status in JobPartPlanHeader in thread-safe manner
 func (jpph *JobPartPlanHeader) SetJobStatus(newJobStatus common.JobStatus) {
 	jpph.atomicJobStatus.AtomicStore(newJobStatus)
+}
+
+func (jpph *JobPartPlanHeader) JobPartStatus() common.JobStatus {
+	return jpph.atomicPartStatus.AtomicLoad()
+}
+
+func (jpph *JobPartPlanHeader) SetJobPartStatus(newJobStatus common.JobStatus) {
+	jpph.atomicPartStatus.AtomicStore(newJobStatus)
 }
 
 // Transfer api gives memory map JobPartPlanTransfer header for given index
@@ -143,16 +170,8 @@ func (jpph *JobPartPlanHeader) TransferSrcDstRelatives(transferIndex uint32) (re
 	return srcRelative, dstRelative
 }
 
-// TransferSrcDstDetail returns the source and destination string for a transfer at given transferIndex in JobPartOrder
-// Also indication of entity type since that's often necessary to avoid ambiguity about what the source and dest are
-func (jpph *JobPartPlanHeader) TransferSrcDstStrings(transferIndex uint32) (source, destination string, isFolder bool) {
-	srcRoot := string(jpph.SourceRoot[:jpph.SourceRootLength])
-	srcExtraQuery := string(jpph.SourceExtraQuery[:jpph.SourceExtraQueryLength])
-	dstRoot := string(jpph.DestinationRoot[:jpph.DestinationRootLength])
-	dstExtraQuery := string(jpph.DestExtraQuery[:jpph.DestExtraQueryLength])
-
+func (jpph *JobPartPlanHeader) GetRelativeSrcDstStrings(transferIndex uint32) (source, destination string) {
 	jppt := jpph.Transfer(transferIndex)
-	isFolder = jppt.EntityType == common.EEntityType.Folder()
 
 	srcSlice := []byte{}
 	sh := (*reflect.SliceHeader)(unsafe.Pointer(&srcSlice))
@@ -167,6 +186,22 @@ func (jpph *JobPartPlanHeader) TransferSrcDstStrings(transferIndex uint32) (sour
 	sh.Len = int(jppt.DstLength)
 	sh.Cap = sh.Len
 	dstRelative := string(dstSlice)
+
+	return srcRelative, dstRelative
+}
+
+// TransferSrcDstDetail returns the source and destination string for a transfer at given transferIndex in JobPartOrder
+// Also indication of entity type since that's often necessary to avoid ambiguity about what the source and dest are
+func (jpph *JobPartPlanHeader) TransferSrcDstStrings(transferIndex uint32) (source, destination string, isFolder bool) {
+	srcRoot := string(jpph.SourceRoot[:jpph.SourceRootLength])
+	srcExtraQuery := string(jpph.SourceExtraQuery[:jpph.SourceExtraQueryLength])
+	dstRoot := string(jpph.DestinationRoot[:jpph.DestinationRootLength])
+	dstExtraQuery := string(jpph.DestExtraQuery[:jpph.DestExtraQueryLength])
+
+	jppt := jpph.Transfer(transferIndex)
+	isFolder = jppt.EntityType == common.EEntityType.Folder()
+
+	srcRelative, dstRelative := jpph.GetRelativeSrcDstStrings(transferIndex)
 
 	return common.GenerateFullPathWithQuery(srcRoot, srcRelative, srcExtraQuery),
 		common.GenerateFullPathWithQuery(dstRoot, dstRelative, dstExtraQuery),
@@ -185,7 +220,7 @@ func (jpph *JobPartPlanHeader) getString(offset int64, length int16) string {
 
 // TransferSrcPropertiesAndMetadata returns the SrcHTTPHeaders, properties and metadata for a transfer at given transferIndex in JobPartOrder
 // TODO: Refactor return type to an object
-func (jpph *JobPartPlanHeader) TransferSrcPropertiesAndMetadata(transferIndex uint32) (h common.ResourceHTTPHeaders, metadata common.Metadata, blobType azblob.BlobType, blobTier azblob.AccessTierType,
+func (jpph *JobPartPlanHeader) TransferSrcPropertiesAndMetadata(transferIndex uint32) (h common.ResourceHTTPHeaders, metadata common.Metadata, blobType blob.BlobType, blobTier blob.AccessTier,
 	s2sGetPropertiesInBackend bool, DestLengthValidation bool, s2sSourceChangeValidation bool, s2sInvalidMetadataHandleOption common.InvalidMetadataHandleOption, entityType common.EntityType, blobVersionID string, blobSnapshotID string, blobTags common.BlobTags) {
 	var err error
 	t := jpph.Transfer(transferIndex)
@@ -231,12 +266,12 @@ func (jpph *JobPartPlanHeader) TransferSrcPropertiesAndMetadata(transferIndex ui
 	}
 	if t.SrcBlobTypeLength != 0 {
 		tmpBlobTypeStr := []byte(jpph.getString(offset, t.SrcBlobTypeLength))
-		blobType = azblob.BlobType(tmpBlobTypeStr)
+		blobType = blob.BlobType(tmpBlobTypeStr)
 		offset += int64(t.SrcBlobTypeLength)
 	}
 	if t.SrcBlobTierLength != 0 {
 		tmpBlobTierStr := []byte(jpph.getString(offset, t.SrcBlobTierLength))
-		blobTier = azblob.AccessTierType(tmpBlobTierStr)
+		blobTier = blob.AccessTier(tmpBlobTierStr)
 		offset += int64(t.SrcBlobTierLength)
 	}
 	if t.SrcBlobVersionIDLength != 0 {
@@ -250,12 +285,12 @@ func (jpph *JobPartPlanHeader) TransferSrcPropertiesAndMetadata(transferIndex ui
 	if t.SrcBlobTagsLength != 0 {
 		blobTagsString := jpph.getString(offset, t.SrcBlobTagsLength)
 		blobTags = common.ToCommonBlobTagsMap(blobTagsString)
-		offset += int64(t.SrcBlobTagsLength)
+		offset += int64(t.SrcBlobTagsLength) //nolint:ineffassign
 	}
 	return
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // JobPartPlanDstBlob holds additional settings required when the destination is a blob
 type JobPartPlanDstBlob struct {
@@ -315,9 +350,18 @@ type JobPartPlanDstBlob struct {
 
 	// Specifies the maximum size of block which determines the number of chunks and chunk size of a transfer
 	BlockSize int64
+
+	SetPropertiesFlags common.SetPropertiesFlags
+
+	DeleteDestinationFileIfNecessary bool
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// JobPartPlanDstFile holds additional settings required when the destination is a file
+type JobPartPlanDstFile struct {
+	TrailingDot common.TrailingDotOption
+}
+
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // jobPartPlanDstLocal holds additional settings required when the destination is a local file
 type JobPartPlanDstLocal struct {
@@ -330,7 +374,7 @@ type JobPartPlanDstLocal struct {
 	MD5VerificationOption common.HashValidationOption
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // JobPartPlanTransfer represent the header of Job Part's Transfer in Memory Map File
 type JobPartPlanTransfer struct {
@@ -343,7 +387,7 @@ type JobPartPlanTransfer struct {
 	// DstLength represents the actual length of destination string for specific transfer
 	DstLength int16
 	// ChunkCount represents the num of chunks a transfer is split into
-	//ChunkCount uint16	// TODO: Remove this, we need to determine it at runtime
+	// ChunkCount uint16	// TODO: Remove this, we need to determine it at runtime
 	// EntityType indicates whether this is a file or a folder
 	// We use a dedicated field for this because the alternative (of doing something fancy the names) was too complex and error-prone
 	EntityType common.EntityType
@@ -395,9 +439,8 @@ func (jppt *JobPartPlanTransfer) SetTransferStatus(status common.TransferStatus,
 	if !overWrite {
 		common.AtomicMorphInt32((*int32)(&jppt.atomicTransferStatus),
 			func(startVal int32) (val int32, morphResult interface{}) {
-				// start value < 0 means that transfer status is already a failed value.
-				// If current transfer status has already failed value, then it will not be changed.
-				return common.Iffint32(startVal < 0, startVal, int32(status)), nil
+				// If current transfer status has some completed value, then it will not be changed.
+				return common.Iff(common.TransferStatus(startVal).StatusLocked(), startVal, int32(status)), nil
 			})
 	} else {
 		(&jppt.atomicTransferStatus).AtomicStore(status)
@@ -418,7 +461,7 @@ func (jppt *JobPartPlanTransfer) SetErrorCode(errorCode int32, overwrite bool) {
 			func(startErrorCode int32) (val int32, morphResult interface{}) {
 				// startErrorCode != 0 means that error code is already set.
 				// If current error code is already set to some error code, then it will not be changed.
-				return common.Iffint32(startErrorCode != 0, startErrorCode, errorCode), nil
+				return common.Iff(startErrorCode != 0, startErrorCode, errorCode), nil
 			})
 	} else {
 		atomic.StoreInt32(&jppt.atomicErrorCode, errorCode)

@@ -21,11 +21,14 @@
 package ste
 
 import (
-	"net/url"
+	"os"
+	"time"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/pageblob"
+
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 type blobDownloader struct {
@@ -37,38 +40,102 @@ type blobDownloader struct {
 
 	// used to avoid downloading zero ranges of page blobs
 	pageRangeOptimizer *pageRangeOptimizer
+	source             *blob.Client
+
+	jptm   IJobPartTransferMgr
+	txInfo *TransferInfo
 }
 
-func newBlobDownloader() downloader {
-	return &blobDownloader{
-		filePacer: newNullAutoPacer(), // defer creation of real one, if needed, to Prologue
+func (bd *blobDownloader) CreateSymlink(jptm IJobPartTransferMgr) error {
+	sip, err := newBlobSourceInfoProvider(jptm)
+	if err != nil {
+		return err
+	}
+	symsip := sip.(ISymlinkBearingSourceInfoProvider) // blob always implements this
+	symlinkInfo, _ := symsip.ReadLink()
+
+	// create the link
+	err = os.Symlink(symlinkInfo, jptm.Info().Destination)
+
+	return err
+}
+
+func newBlobDownloader(jptm IJobPartTransferMgr) (downloader, error) {
+	s, err := jptm.SrcServiceClient().BlobServiceClient()
+	if err != nil {
+		return nil, err
 	}
 
+	blobClient := s.NewContainerClient(jptm.Info().SrcContainer).NewBlobClient(jptm.Info().SrcFilePath)
+
+	if jptm.Info().VersionID != "" {
+		blobClient, err = blobClient.WithVersionID(jptm.Info().VersionID)
+		if err != nil {
+			return nil, err
+		}
+	} else if jptm.Info().SnapshotID != "" {
+		blobClient, err = blobClient.WithSnapshot(jptm.Info().SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &blobDownloader{
+		filePacer: NewNullAutoPacer(), // defer creation of real one, if needed, to Prologue
+		source:    blobClient,
+	}, nil
 }
 
-func (bd *blobDownloader) Prologue(jptm IJobPartTransferMgr, srcPipeline pipeline.Pipeline) {
-	if jptm.Info().SrcBlobType == azblob.BlobPageBlob {
+func (bd *blobDownloader) Prologue(jptm IJobPartTransferMgr) {
+	bd.txInfo = jptm.Info()
+	bd.jptm = jptm
+
+	if jptm.Info().SrcBlobType == blob.BlobTypePageBlob {
 		// page blobs need a file-specific pacer
 		// See comments in uploader-pageBlob for the reasons, since the same reasons apply are are explained there
 		bd.filePacer = newPageBlobAutoPacer(pageBlobInitialBytesPerSecond, jptm.Info().BlockSize, false, jptm.(common.ILogger))
 
-		u, _ := url.Parse(jptm.Info().Source)
-		bd.pageRangeOptimizer = newPageRangeOptimizer(azblob.NewPageBlobURL(*u, srcPipeline), jptm.Context())
+		// This is safe. We've already asserted that SrcServiceClient() is
+		// a blob service client.
+		s, _ := jptm.SrcServiceClient().BlobServiceClient()
+		c := s.NewContainerClient(jptm.Info().SrcContainer)
+		bd.pageRangeOptimizer = newPageRangeOptimizer(c.NewPageBlobClient(bd.txInfo.SrcFilePath), jptm.Context())
 		bd.pageRangeOptimizer.fetchPages()
 	}
 }
 
 func (bd *blobDownloader) Epilogue() {
+	if bd.jptm != nil {
+		if bd.jptm.IsLive() && bd.jptm.Info().PreservePOSIXProperties {
+			bsip, err := newBlobSourceInfoProvider(bd.jptm)
+			if err != nil {
+				bd.jptm.FailActiveDownload("get blob source info provider", err)
+			}
+			unixstat, _ := bsip.(IUNIXPropertyBearingSourceInfoProvider)
+			if ubd, ok := (interface{})(bd).(unixPropertyAwareDownloader); ok && unixstat.HasUNIXProperties() {
+				adapter, err := unixstat.GetUNIXProperties()
+				if err != nil {
+					bd.jptm.FailActiveDownload("get unix properties", err)
+				}
+
+				stage, err := ubd.ApplyUnixProperties(adapter)
+				if err != nil {
+					bd.jptm.FailActiveDownload("set unix properties: "+stage, err)
+				}
+			}
+		}
+	}
+
 	_ = bd.filePacer.Close()
 }
 
 // Returns a chunk-func for blob downloads
-func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, srcPipeline pipeline.Pipeline, destWriter common.ChunkedFileWriter, id common.ChunkID, length int64, pacer pacer) chunkFunc {
+func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, destWriter common.ChunkedFileWriter, id common.ChunkID, length int64, pacer pacer) chunkFunc {
 	return createDownloadChunkFunc(jptm, id, func() {
 
 		// If the range does not contain any data, write out empty data to disk without performing download
-		if bd.pageRangeOptimizer != nil && !bd.pageRangeOptimizer.doesRangeContainData(
-			azblob.PageRange{Start: id.OffsetInFile(), End: id.OffsetInFile() + length - 1}) {
+		pageRange := pageblob.PageRange{Start: to.Ptr(id.OffsetInFile()), End: to.Ptr(id.OffsetInFile() + length - 1)}
+		if bd.pageRangeOptimizer != nil && !bd.pageRangeOptimizer.doesRangeContainData(pageRange) {
 
 			// queue an empty chunk
 			err := destWriter.EnqueueChunk(jptm.Context(), id, length, dummyReader{}, false)
@@ -92,23 +159,15 @@ func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, srcPipe
 		}
 
 		// download blob from start Index till startIndex + adjustedChunkSize
-		info := jptm.Info()
-		u, _ := url.Parse(info.Source)
-		srcBlobURL := azblob.NewBlobURL(*u, srcPipeline)
-
+		// TODO (gapra) : This can be removed after Access Conditions fix is released.
 		// set access conditions, to protect against inconsistencies from changes-while-being-read
-		accessConditions := azblob.BlobAccessConditions{ModifiedAccessConditions: azblob.ModifiedAccessConditions{IfUnmodifiedSince: jptm.LastModifiedTime()}}
-		if isInManagedDiskImportExportAccount(*u) {
+		lmt := jptm.LastModifiedTime().In(time.FixedZone("GMT", 0))
+		accessConditions := &blob.AccessConditions{ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfUnmodifiedSince: &lmt}}
+		if isInManagedDiskImportExportAccount(jptm.Info().Source) {
 			// no access conditions (and therefore no if-modified checks) are supported on managed disk import/export (md-impexp)
 			// They are also unsupported on old "md-" style export URLs on the new (2019) large size disks.
 			// And if fact you can't have an md- URL in existence if the blob is mounted as a disk, so it won't be getting changed anyway, so we just treat all md-disks the same
-			accessConditions = azblob.BlobAccessConditions{}
-		}
-
-		// Once track2 goes live, we'll not need to do this conversion/casting and can directly use CpkInfo & CpkScopeInfo
-		clientProvidedKey := azblob.ClientProvidedKeyOptions{}
-		if jptm.IsSourceEncrypted() {
-			clientProvidedKey = common.ToClientProvidedKeyOptions(jptm.CpkInfo(), jptm.CpkScopeInfo())
+			accessConditions = nil
 		}
 
 		// At this point we create an HTTP(S) request for the desired portion of the blob, and
@@ -116,7 +175,12 @@ func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, srcPipe
 		// The Download method encapsulates any retries that may be necessary to get to the point of receiving response headers.
 		jptm.LogChunkStatus(id, common.EWaitReason.HeaderResponse())
 		enrichedContext := withRetryNotification(jptm.Context(), bd.filePacer)
-		get, err := srcBlobURL.Download(enrichedContext, id.OffsetInFile(), length, accessConditions, false, clientProvidedKey)
+		get, err := bd.source.DownloadStream(enrichedContext, &blob.DownloadStreamOptions{
+			Range:            blob.HTTPRange{Offset: id.OffsetInFile(), Count: length},
+			AccessConditions: accessConditions,
+			CPKInfo:          jptm.CpkInfo(),
+			CPKScopeInfo:     jptm.CpkScopeInfo(),
+		})
 		if err != nil {
 			jptm.FailActiveDownload("Downloading response body", err) // cancel entire transfer because this chunk has failed
 			return
@@ -125,9 +189,9 @@ func (bd *blobDownloader) GenerateDownloadFunc(jptm IJobPartTransferMgr, srcPipe
 		// Enqueue the response body to be written out to disk
 		// The retryReader encapsulates any retries that may be necessary while downloading the body
 		jptm.LogChunkStatus(id, common.EWaitReason.Body())
-		retryReader := get.Body(azblob.RetryReaderOptions{
-			MaxRetryRequests: destWriter.MaxRetryPerDownloadBody(),
-			NotifyFailedRead: common.NewReadLogFunc(jptm, u),
+		retryReader := get.NewRetryReader(enrichedContext, &blob.RetryReaderOptions{
+			MaxRetries:   int32(destWriter.MaxRetryPerDownloadBody()),
+			OnFailedRead: common.NewBlobReadLogFunc(jptm, jptm.Info().Source),
 		})
 		defer retryReader.Close()
 		err = destWriter.EnqueueChunk(jptm.Context(), id, length, newPacedResponseBody(jptm.Context(), retryReader, pacer), true)

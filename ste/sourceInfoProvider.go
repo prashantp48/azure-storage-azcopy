@@ -21,15 +21,14 @@
 package ste
 
 import (
-	"net/url"
+	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/file"
 	"os"
+	"strconv"
 	"time"
 
-	"github.com/Azure/azure-storage-file-go/azfile"
-
 	"github.com/Azure/azure-storage-azcopy/v10/common"
-
-	"github.com/Azure/azure-storage-blob-go/azblob"
 )
 
 // ISourceInfoProvider is the abstraction of generic source info provider which provides source's properties.
@@ -44,6 +43,8 @@ type ISourceInfoProvider interface {
 	IsLocal() bool
 
 	EntityType() common.EntityType
+
+	GetMD5(offset, count int64) ([]byte, error)
 }
 
 type ILocalSourceInfoProvider interface {
@@ -56,7 +57,7 @@ type IRemoteSourceInfoProvider interface {
 	ISourceInfoProvider
 
 	// SourceURL returns source's URL.
-	PreSignedSourceURL() (*url.URL, error)
+	PreSignedSourceURL() (string, error)
 
 	// SourceSize returns size of source
 	SourceSize() int64
@@ -72,16 +73,16 @@ type IBlobSourceInfoProvider interface {
 	IRemoteSourceInfoProvider
 
 	// BlobTier returns source's blob tier.
-	BlobTier() azblob.AccessTierType
+	BlobTier() *blob.AccessTier
 
 	// BlobType returns source's blob type.
-	BlobType() azblob.BlobType
+	BlobType() blob.BlobType
 }
 
 type TypedSMBPropertyHolder interface {
 	FileCreationTime() time.Time
 	FileLastWriteTime() time.Time
-	FileAttributes() azfile.FileAttributeFlags
+	FileAttributes() (*file.NTFSFileAttributes, error)
 }
 
 type ISMBPropertyBearingSourceInfoProvider interface {
@@ -91,6 +92,19 @@ type ISMBPropertyBearingSourceInfoProvider interface {
 	GetSMBProperties() (TypedSMBPropertyHolder, error)
 }
 
+type IUNIXPropertyBearingSourceInfoProvider interface {
+	ISourceInfoProvider
+
+	GetUNIXProperties() (common.UnixStatAdapter, error)
+	HasUNIXProperties() bool
+}
+
+type ISymlinkBearingSourceInfoProvider interface {
+	ISourceInfoProvider
+
+	ReadLink() (string, error)
+}
+
 type ICustomLocalOpener interface {
 	ISourceInfoProvider
 	Open(path string) (*os.File, error)
@@ -98,27 +112,18 @@ type ICustomLocalOpener interface {
 
 type sourceInfoProviderFactory func(jptm IJobPartTransferMgr) (ISourceInfoProvider, error)
 
-/////////////////////////////////////////////////////////////////////////////////////////////////
+// ///////////////////////////////////////////////////////////////////////////////////////////////
 // Default copy remote source info provider which provides info sourced from transferInfo.
 // It implements all methods of ISourceInfoProvider except for GetFreshLastModifiedTime.
 // It's never correct to implement that based on the transfer info, because the whole point is that it should
 // return FRESH (up to date) data.
 type defaultRemoteSourceInfoProvider struct {
 	jptm         IJobPartTransferMgr
-	transferInfo TransferInfo
+	transferInfo *TransferInfo
 }
 
 func newDefaultRemoteSourceInfoProvider(jptm IJobPartTransferMgr) (*defaultRemoteSourceInfoProvider, error) {
 	return &defaultRemoteSourceInfoProvider{jptm: jptm, transferInfo: jptm.Info()}, nil
-}
-
-func (p *defaultRemoteSourceInfoProvider) PreSignedSourceURL() (*url.URL, error) {
-	srcURL, err := url.Parse(p.transferInfo.Source)
-	if err != nil {
-		return nil, err
-	}
-
-	return srcURL, nil
 }
 
 func (p *defaultRemoteSourceInfoProvider) Properties() (*SrcProperties, error) {
@@ -137,10 +142,19 @@ func (p *defaultRemoteSourceInfoProvider) SourceSize() int64 {
 	return p.transferInfo.SourceSize
 }
 
-func (p *defaultRemoteSourceInfoProvider) RawSource() string {
-	return p.transferInfo.Source
-}
-
 func (p *defaultRemoteSourceInfoProvider) EntityType() common.EntityType {
 	return p.transferInfo.EntityType
+}
+
+// formatHTTPRange converts an offset and count to its header format.
+func formatHTTPRange(offset, count int64) *string {
+	if offset == 0 && count == 0 {
+		return nil // No specified range
+	}
+	endOffset := "" // if count == CountToEnd (0)
+	if count > 0 {
+		endOffset = strconv.FormatInt((offset+count)-1, 10)
+	}
+	dataRange := fmt.Sprintf("bytes=%v-%s", offset, endOffset)
+	return &dataRange
 }

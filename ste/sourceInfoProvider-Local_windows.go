@@ -3,8 +3,8 @@
 package ste
 
 import (
-	"errors"
 	"fmt"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azfile/file"
 	"os"
 	"strings"
 	"syscall"
@@ -15,7 +15,6 @@ import (
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 
-	"github.com/Azure/azure-storage-file-go/azfile"
 	"golang.org/x/sys/windows"
 
 	"github.com/Azure/azure-storage-azcopy/v10/sddl"
@@ -62,20 +61,43 @@ func (f localFileSourceInfoProvider) GetSDDL() (string, error) {
 	}
 	buf := make([]byte, 512)
 	bufLen := uint32(len(buf))
+	needValidate := false
 	status := ntdll.CallWithExpandingBuffer(func() ntdll.NtStatus {
-		return ntdll.NtQuerySecurityObject(
+		status := ntdll.NtQuerySecurityObject(
 			fd,
 			windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
 			(*ntdll.SecurityDescriptor)(unsafe.Pointer(&buf[0])),
 			uint32(len(buf)),
 			&bufLen)
+
+		/*
+			On certain older versions of Windows/Server and certain SAN/SMB emulator software,
+			on any status but STATUS_BUFFER_TOO_SMALL, bufLen will be returned as 0.
+
+			CallWithExpandingBuffer does not handle this correctly.
+			Thus, we have to attain the real length of the security descriptor and correct the output,
+			otherwise we panic due to an OOB error on the array.
+		*/
+
+		// get real buffer length, since what's returned by ntquerysecurityobject is questionable for STATUS_SUCCESS
+		if status == ntdll.STATUS_SUCCESS {
+			sd := (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(&buf[0])) // ntdll.SecurityDescriptor is equivalent
+
+			bufLen = sd.Length()
+			needValidate = true
+		}
+
+		return status
 	}, &buf, &bufLen)
 
 	if status != ntdll.STATUS_SUCCESS {
-		return "", errors.New(fmt.Sprint("failed to query security object", f.jptm.Info().Source, "ntstatus:", status))
+		return "", fmt.Errorf("failed to query security object %s (ntstatus: %s)", f.jptm.Info().Source, status.String())
 	}
 
 	sd := (*windows.SECURITY_DESCRIPTOR)(unsafe.Pointer(&buf[0])) // ntdll.SecurityDescriptor is equivalent
+	if needValidate && !sd.IsValid() {
+		return "", fmt.Errorf("failed to query security object %s (invalid security descriptor returned w/ success status)", f.jptm.Info().Source)
+	}
 	fSDDL, err := sddl.ParseSDDL(sd.String())
 
 	if err != nil {
@@ -107,7 +129,7 @@ func (hi HandleInfo) FileLastWriteTime() time.Time {
 	return time.Unix(0, hi.LastWriteTime.Nanoseconds())
 }
 
-func (hi HandleInfo) FileAttributes() azfile.FileAttributeFlags {
+func (hi HandleInfo) FileAttributes() (*file.NTFSFileAttributes, error) {
 	// Can't shorthand it because the function name overrides.
-	return azfile.FileAttributeFlags(hi.ByHandleFileInformation.FileAttributes)
+	return FileAttributesFromUint32(hi.ByHandleFileInformation.FileAttributes)
 }

@@ -21,12 +21,11 @@
 package ste
 
 import (
-	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
 // anyToRemote_folder handles all kinds of sender operations for FOLDERS - both uploads from local files, and S2S copies
-func anyToRemote_folder(jptm IJobPartTransferMgr, info TransferInfo, p pipeline.Pipeline, pacer pacer, senderFactory senderFactory, sipf sourceInfoProviderFactory) {
+func anyToRemote_folder(jptm IJobPartTransferMgr, info *TransferInfo, pacer pacer, senderFactory senderFactory, sipf sourceInfoProviderFactory) {
 
 	// step 1. perform initial checks
 	if jptm.WasCanceled() {
@@ -48,7 +47,7 @@ func anyToRemote_folder(jptm IJobPartTransferMgr, info TransferInfo, p pipeline.
 		panic("configuration error. Source Info Provider does not have Folder entity type")
 	}
 
-	baseSender, err := senderFactory(jptm, info.Destination, p, pacer, srcInfoProvider)
+	baseSender, err := senderFactory(jptm, info.Destination, pacer, srcInfoProvider)
 	if err != nil {
 		jptm.LogSendError(info.Source, info.Destination, err.Error(), 0)
 		jptm.SetStatus(common.ETransferStatus.Failed())
@@ -69,14 +68,24 @@ func anyToRemote_folder(jptm IJobPartTransferMgr, info TransferInfo, p pipeline.
 	// of those issues apply to folders.
 	err = s.EnsureFolderExists() // we may create it here, or possible there's already a file transfer for the folder that has created it, or maybe it already existed before this job
 	if err != nil {
-		jptm.FailActiveSend("ensuring destination folder exists", err)
+		switch err {
+		case folderPropertiesSetInCreation{}:
+			// Continue to standard completion.
+		case folderPropertiesNotOverwroteInCreation{}:
+			jptm.LogAtLevelForCurrentTransfer(common.LogWarning, "Folder already exists, so due to the --overwrite option, its properties won't be set")
+			jptm.SetStatus(common.ETransferStatus.SkippedEntityAlreadyExists()) // using same status for both files and folders, for simplicity
+			jptm.ReportTransferDone()
+			return
+		default:
+			jptm.FailActiveSend("ensuring destination folder exists", err)
+		}
 	} else {
 
 		t := jptm.GetFolderCreationTracker()
 		defer t.StopTracking(s.DirUrlToString()) // don't need it after this routine
 		shouldSetProps := t.ShouldSetProperties(s.DirUrlToString(), jptm.GetOverwriteOption(), jptm.GetOverwritePrompter())
 		if !shouldSetProps {
-			jptm.LogAtLevelForCurrentTransfer(pipeline.LogWarning, "Folder already exists, so due to the --overwrite option, its properties won't be set")
+			jptm.LogAtLevelForCurrentTransfer(common.LogWarning, "Folder already exists, so due to the --overwrite option, its properties won't be set")
 			jptm.SetStatus(common.ETransferStatus.SkippedEntityAlreadyExists()) // using same status for both files and folders, for simplicity
 			jptm.ReportTransferDone()
 			return

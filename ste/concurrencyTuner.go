@@ -21,7 +21,6 @@
 package ste
 
 import (
-	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"sync"
 	"sync/atomic"
 )
@@ -41,23 +40,23 @@ type ConcurrencyTuner interface {
 	recordRetry()
 }
 
-type nullConcurrencyTuner struct {
-	fixedValue int
+type NullConcurrencyTuner struct {
+	FixedValue int
 }
 
-func (n *nullConcurrencyTuner) GetRecommendedConcurrency(currentMbps int, highCpuUsage bool) (newConcurrency int, reason string) {
-	return n.fixedValue, concurrencyReasonFinished
+func (n *NullConcurrencyTuner) GetRecommendedConcurrency(currentMbps int, highCpuUsage bool) (newConcurrency int, reason string) {
+	return n.FixedValue, concurrencyReasonFinished
 }
 
-func (n *nullConcurrencyTuner) RequestCallbackWhenStable(callback func()) (callbackAccepted bool) {
+func (n *NullConcurrencyTuner) RequestCallbackWhenStable(callback func()) (callbackAccepted bool) {
 	return false
 }
 
-func (n *nullConcurrencyTuner) GetFinalState() (finalReason string, finalRecommendedConcurrency int) {
-	return concurrencyReasonTunerDisabled, n.fixedValue
+func (n *NullConcurrencyTuner) GetFinalState() (finalReason string, finalRecommendedConcurrency int) {
+	return ConcurrencyReasonTunerDisabled, n.FixedValue
 }
 
-func (n *nullConcurrencyTuner) recordRetry() {
+func (n *NullConcurrencyTuner) recordRetry() {
 	// noop
 }
 
@@ -73,7 +72,6 @@ type autoConcurrencyTuner struct {
 	}
 	initialConcurrency  int
 	maxConcurrency      int
-	cpuMonitor          common.CPUMonitor
 	callbacksWhenStable chan func()
 	finalReason         string
 	finalConcurrency    int
@@ -127,8 +125,8 @@ func (t *autoConcurrencyTuner) recordRetry() {
 }
 
 const (
-	concurrencyReasonNone          = ""
-	concurrencyReasonTunerDisabled = "tuner disabled" // used as the final (non-finished) state for null tuner
+	ConcurrencyReasonNone          = ""
+	ConcurrencyReasonTunerDisabled = "tuner disabled" // used as the final (non-finished) state for null tuner
 	concurrencyReasonInitial       = "initial starting point"
 	concurrencyReasonSeeking       = "seeking optimum"
 	concurrencyReasonBackoff       = "backing off"
@@ -155,7 +153,7 @@ func (t *autoConcurrencyTuner) worker() {
 	probeHigherRegardless := false
 	dontBackoffRegardless := false
 	multiplierReductionCount := 0
-	lastReason := concurrencyReasonNone
+	lastReason := ConcurrencyReasonNone
 
 	// get initial baseline throughput
 	lastSpeed, _ := t.getCurrentSpeed()
@@ -233,10 +231,10 @@ func (t *autoConcurrencyTuner) worker() {
 			}
 
 			if multiplier < minMulitplier {
-				break // no point in tuning any more
+				break // no point in tuning anymore
 			} else {
-				lastReason = t.setConcurrency(concurrency, concurrencyReasonBackoff)
-				lastSpeed, _ = t.getCurrentSpeed() // must re-measure immediately after backing off
+				lastReason = t.setConcurrency(concurrency, concurrencyReasonBackoff) //nolint:staticcheck
+				lastSpeed, _ = t.getCurrentSpeed()                                   // must re-measure immediately after backing off
 			}
 		}
 	}
@@ -274,7 +272,7 @@ func (t *autoConcurrencyTuner) setConcurrency(mbps float32, reason string) strin
 }
 
 func (t *autoConcurrencyTuner) getCurrentSpeed() (mbps float32, isHighCpu bool) {
-	// assume that any necessary time delays, to measure or to wait for stablization,
+	// assume that any necessary time delays, to measure or to wait for stabilization,
 	// are done by the caller of GetRecommendedConcurrency
 	ob := <-t.observations
 	return float32(ob.mbps), ob.isHighCpu

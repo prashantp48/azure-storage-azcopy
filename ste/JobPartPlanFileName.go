@@ -23,26 +23,27 @@ func (jppfn *JobPartPlanFileName) Exists() bool {
 }
 
 func (jppfn *JobPartPlanFileName) GetJobPartPlanPath() string {
-	return fmt.Sprintf("%s%s%s", JobsAdmin.AppPathFolder(), common.AZCOPY_PATH_SEPARATOR_STRING, string(*jppfn))
+	return fmt.Sprintf("%s%s%s", common.AzcopyJobPlanFolder, common.AZCOPY_PATH_SEPARATOR_STRING, string(*jppfn))
 }
 
-const jobPartPlanFileNameFormat = "%v--%05d.steV%d"
+const JobPartPlanFileNameFormat = "%v--%05d.steV%d"
 
 // TODO: This needs testing
 func (jpfn JobPartPlanFileName) Parse() (jobID common.JobID, partNumber common.PartNumber, err error) {
 	var dataSchemaVersion common.Version
-	//n, err := fmt.Sscanf(string(jpfn), jobPartPlanFileNameFormat, &jobID, &partNumber, &dataSchemaVersion)
-	//if err != nil || n != 3 {
+	// n, err := fmt.Sscanf(string(jpfn), jobPartPlanFileNameFormat, &jobID, &partNumber, &dataSchemaVersion)
+	// if err != nil || n != 3 {
 	//	panic(err)
-	//}
-	//if dataSchemaVersion != DataSchemaVersion {
+	// }
+	// if dataSchemaVersion != DataSchemaVersion {
 	//	err = fmt.Errorf("job part Plan file's data schema version ('%d') doesn't match whatthis app requires ('%d')", dataSchemaVersion, DataSchemaVersion)
-	//}
-	//TODO: confirm the alternative approach. fmt.Sscanf not working for reading back string into struct JobId.
+	// }
+	// TODO: confirm the alternative approach. fmt.Sscanf not working for reading back string into struct JobId.
 	jpfnSplit := strings.Split(string(jpfn), "--")
 	jobId, err := common.ParseJobID(jpfnSplit[0])
 	if err != nil {
-		err = fmt.Errorf("failed to parse the JobId from JobPartFileName %s. Failed with error %s", string(jpfn), err.Error())
+		err = fmt.Errorf("failed to parse the JobId from JobPartFileName %s. Failed with error %s", string(jpfn), err.Error()) //nolint:staticcheck
+		// TODO: return here on error? or ignore
 	}
 	jobID = jobId
 	n, err := fmt.Sscanf(jpfnSplit[1], "%05d.steV%d", &partNumber, &dataSchemaVersion)
@@ -76,7 +77,7 @@ func (jpfn JobPartPlanFileName) Map() *JobPartPlanMMF {
 // createJobPartPlanFile creates the memory map JobPartPlanHeader using the given JobPartOrder and JobPartPlanBlobData
 func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	if jpfn.Exists() {
-		panic(fmt.Sprint("Duplicate job created. You probably shouldn't ever see this, but if you do, try cleaning out", JobsAdmin.(*jobsAdmin).planDir))
+		panic(fmt.Sprint("Duplicate job created. You probably shouldn't ever see this, but if you do, try cleaning out", jpfn.GetJobPartPlanPath()))
 	}
 
 	// Validate that the passed-in strings can fit in their respective fields
@@ -119,7 +120,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		rv := reflect.ValueOf(v)
 		structSize := reflect.TypeOf(v).Elem().Size()
 		slice := reflect.SliceHeader{Data: rv.Pointer(), Len: int(structSize), Cap: int(structSize)}
-		byteSlice := *(*[]byte)(unsafe.Pointer(&slice))
+		byteSlice := *(*[]byte)(unsafe.Pointer(&slice)) //nolint:govet
 		err := binary.Write(writer, binary.LittleEndian, byteSlice)
 		common.PanicIfErr(err)
 		return int64(structSize)
@@ -137,7 +138,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	 */
 
 	// create the Job Part Plan file
-	//planPathname := planDir + "/" + string(jpfn)
+	// planPathname := planDir + "/" + string(jpfn)
 	file, err := os.Create(jpfn.GetJobPartPlanPath())
 	if err != nil {
 		panic(fmt.Errorf("couldn't create job part plan file %q: %v", jpfn, err))
@@ -150,7 +151,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	// it means that user provided some block-size and  auto-correct will not
 	// apply.
 	blockSize := order.BlobAttributes.BlockSizeInBytes
-	//if blockSize == 0 { // TODO: Fix below
+	// if blockSize == 0 { // TODO: Fix below
 	//	blockSize = common.DefaultBlockBlobBlockSize
 	//	/*switch order.BlobAttributes.BlobType {
 	//	case common.BlobType{}.Block():
@@ -162,7 +163,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 	//	default:
 	//		panic(errors.New("unrecognized blob type"))
 	//	}*/
-	//}
+	// }
 	// Initialize the Job Part's Plan header
 	jpph := JobPartPlanHeader{
 		Version:                DataSchemaVersion,
@@ -185,37 +186,45 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 		NumTransfers:           uint32(len(order.Transfers.List)),
 		LogLevel:               order.LogLevel,
 		DstBlobData: JobPartPlanDstBlob{
-			BlobType:                 order.BlobAttributes.BlobType,
-			NoGuessMimeType:          order.BlobAttributes.NoGuessMimeType,
-			ContentTypeLength:        uint16(len(order.BlobAttributes.ContentType)),
-			ContentEncodingLength:    uint16(len(order.BlobAttributes.ContentEncoding)),
-			ContentDispositionLength: uint16(len(order.BlobAttributes.ContentDisposition)),
-			ContentLanguageLength:    uint16(len(order.BlobAttributes.ContentLanguage)),
-			CacheControlLength:       uint16(len(order.BlobAttributes.CacheControl)),
-			PutMd5:                   order.BlobAttributes.PutMd5, // here because it relates to uploads (blob destination)
-			BlockBlobTier:            order.BlobAttributes.BlockBlobTier,
-			PageBlobTier:             order.BlobAttributes.PageBlobTier,
-			MetadataLength:           uint16(len(order.BlobAttributes.Metadata)),
-			BlockSize:                blockSize,
-			BlobTagsLength:           uint16(len(order.BlobAttributes.BlobTagsString)),
-			CpkInfo:                  order.CpkOptions.CpkInfo,
-			CpkScopeInfoLength:       uint16(len(order.CpkOptions.CpkScopeInfo)),
-			IsSourceEncrypted:        order.CpkOptions.IsSourceEncrypted,
+			BlobType:                         order.BlobAttributes.BlobType,
+			NoGuessMimeType:                  order.BlobAttributes.NoGuessMimeType,
+			ContentTypeLength:                uint16(len(order.BlobAttributes.ContentType)),
+			ContentEncodingLength:            uint16(len(order.BlobAttributes.ContentEncoding)),
+			ContentDispositionLength:         uint16(len(order.BlobAttributes.ContentDisposition)),
+			ContentLanguageLength:            uint16(len(order.BlobAttributes.ContentLanguage)),
+			CacheControlLength:               uint16(len(order.BlobAttributes.CacheControl)),
+			PutMd5:                           order.BlobAttributes.PutMd5, // here because it relates to uploads (blob destination)
+			BlockBlobTier:                    order.BlobAttributes.BlockBlobTier,
+			PageBlobTier:                     order.BlobAttributes.PageBlobTier,
+			MetadataLength:                   uint16(len(order.BlobAttributes.Metadata)),
+			BlockSize:                        blockSize,
+			BlobTagsLength:                   uint16(len(order.BlobAttributes.BlobTagsString)),
+			CpkInfo:                          order.CpkOptions.CpkInfo,
+			CpkScopeInfoLength:               uint16(len(order.CpkOptions.CpkScopeInfo)),
+			IsSourceEncrypted:                order.CpkOptions.IsSourceEncrypted,
+			SetPropertiesFlags:               order.SetPropertiesFlags,
+			DeleteDestinationFileIfNecessary: order.BlobAttributes.DeleteDestinationFileIfNecessary,
 		},
 		DstLocalData: JobPartPlanDstLocal{
 			PreserveLastModifiedTime: order.BlobAttributes.PreserveLastModifiedTime,
 			MD5VerificationOption:    order.BlobAttributes.MD5ValidationOption, // here because it relates to downloads (file destination)
 		},
-		PreservePermissions: order.PreserveSMBPermissions,
-		PreserveSMBInfo:     order.PreserveSMBInfo,
+		PreservePermissions:     order.PreserveSMBPermissions,
+		PreserveSMBInfo:         order.PreserveSMBInfo,
+		PreservePOSIXProperties: order.PreservePOSIXProperties,
 		// For S2S copy, per JobPartPlan info
 		S2SGetPropertiesInBackend:      order.S2SGetPropertiesInBackend,
 		S2SSourceChangeValidation:      order.S2SSourceChangeValidation,
 		S2SInvalidMetadataHandleOption: order.S2SInvalidMetadataHandleOption,
 		DestLengthValidation:           order.DestLengthValidation,
+		BlobFSRecursiveDelete:          order.BlobFSRecursiveDelete,
 		atomicJobStatus:                common.EJobStatus.InProgress(), // We default to InProgress
 		DeleteSnapshotsOption:          order.BlobAttributes.DeleteSnapshotsOption,
 		PermanentDeleteOption:          order.BlobAttributes.PermanentDeleteOption,
+		RehydratePriority:              order.BlobAttributes.RehydratePriority,
+		DstFileData: JobPartPlanDstFile{
+			TrailingDot: order.FileAttributes.TrailingDot,
+		},
 	}
 
 	// Copy any strings into their respective fields
@@ -311,7 +320,7 @@ func (jpfn JobPartPlanFileName) Create(order common.CopyJobPartOrderRequest) {
 			SrcBlobTagsLength:           int16(srcBlobTagsLength),
 
 			atomicTransferStatus: common.ETransferStatus.Started(), // Default
-			//ChunkNum:                getNumChunks(uint64(order.Transfers.List[t].SourceSize), uint64(data.BlockSize)),
+			// ChunkNum:                getNumChunks(uint64(order.Transfers.List[t].SourceSize), uint64(data.BlockSize)),
 		}
 		eof += writeValue(file, &jppt) // Write the transfer entry
 

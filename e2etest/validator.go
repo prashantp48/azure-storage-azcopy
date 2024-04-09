@@ -23,6 +23,9 @@ package e2etest
 import (
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 
@@ -49,12 +52,17 @@ func fixSlashes(s string, loc common.Location) string {
 	return s
 }
 
+// versionIDRegex is intended to capture variations of the destination version ID.
+var versionIDRegex = regexp.MustCompile("^\\d{4}-\\d{2}-\\d{2}T\\d{2}[-:]\\d{2}[-:]\\d{2}\\.\\d{7}Z")
+
 func (Validator) ValidateRemoveTransfer(c asserter, isSrcEncoded bool, isDstEncoded bool,
 	sourcePrefix string, destinationPrefix string, expectedTransfers []*testObject, actualTransfers []common.TransferDetail, statusToTest common.TransferStatus) {
 	// TODO: Think of how to validate files in case of remove
 }
-func (Validator) ValidateCopyTransfersAreScheduled(c asserter, isSrcEncoded bool, isDstEncoded bool,
-	sourcePrefix string, destinationPrefix string, expectedTransfers []*testObject, actualTransfers []common.TransferDetail, statusToTest common.TransferStatus, fromTo common.FromTo) {
+func (Validator) ValidateCopyTransfersAreScheduled(s *scenario, isSrcEncoded bool, isDstEncoded bool,
+	sourcePrefix string, destinationPrefix string, expectedTransfers []*testObject, actualTransfers []common.TransferDetail, statusToTest common.TransferStatus, expectFolders bool) {
+	c := s.a
+	tf := s.GetTestFiles()
 
 	sourcePrefix = makeSlashesComparable(sourcePrefix)
 	destinationPrefix = makeSlashesComparable(destinationPrefix)
@@ -82,12 +90,13 @@ func (Validator) ValidateCopyTransfersAreScheduled(c asserter, isSrcEncoded bool
 		return s + "/"
 	}
 	lookupMap := scenarioHelper{}.convertListToMap(expectedTransfers, func(to *testObject) string {
-		if to.isFolder() && fromTo != common.EFromTo.BlobBlob() { // Blob has no concept of folders, except in ADLSG2. However, internally, they're treated as blobs anyway.
+		if to.isFolder() && expectFolders {
 			return addFolderSuffix(to.name)
 		} else {
 			return to.name
 		}
 	})
+
 	for _, transfer := range actualTransfers {
 		if snapshotID != "" {
 			c.Assert(strings.Contains(transfer.Src, snapshotID), equals(), true)
@@ -119,8 +128,19 @@ func (Validator) ValidateCopyTransfersAreScheduled(c asserter, isSrcEncoded bool
 			dstRelativeFilePath, _ = url.PathUnescape(dstRelativeFilePath)
 		}
 
-		// the relative paths should be equal
-		c.Assert(srcRelativeFilePath, equals(), dstRelativeFilePath)
+		if tf.isListOfVersions() { // Append the appropriate version for the lookup
+			versionID := versionIDRegex.FindString(filepath.Base(dstRelativeFilePath))
+			c.Assert(versionID, notEquals(), "", "expected to find a version attached to the file name")
+			// flatten the version ID
+			versionID = strings.ReplaceAll(versionID, ":", "-")
+
+			srcRelativeFilePath = filepath.Join(filepath.Dir(srcRelativeFilePath), versionID+"-"+filepath.Base(srcRelativeFilePath))
+		}
+
+		if transfer.Dst != os.DevNull { // Don't check if the destination is NUL-- It won't be correct.
+			// the relative paths should be equal
+			c.Assert(dstRelativeFilePath, equals(), srcRelativeFilePath)
+		}
 
 		// look up the path from the expected transfers, make sure it exists
 		folderMessage := ""

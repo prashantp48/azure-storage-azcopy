@@ -24,8 +24,8 @@ type gcpServiceTraverser struct {
 
 var projectID = ""
 
-func (t *gcpServiceTraverser) IsDirectory(isSource bool) bool {
-	return true //Account traversals are inherently folder based
+func (t *gcpServiceTraverser) IsDirectory(isSource bool) (bool, error) {
+	return true, nil //Account traversals are inherently folder based
 }
 
 func (t *gcpServiceTraverser) listContainers() ([]string, error) {
@@ -110,5 +110,5 @@ func newGCPServiceTraverser(rawURL *url.URL, ctx context.Context, getProperties 
 
 	t.gcpURL = gcpURLParts
 	t.gcpClient, err = common.CreateGCPClient(t.ctx)
-	return t, nil
+	return t, err
 }

@@ -21,29 +21,16 @@
 package main
 
 import (
+	"github.com/minio/minio-go"
 	"math"
 	"net/http"
-	"os"
-	"os/exec"
 	"path"
 	"strings"
-	"syscall"
-
-	"github.com/minio/minio-go"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 )
 
-func osModifyProcessCommand(cmd *exec.Cmd) *exec.Cmd {
-	// On Windows, create the child process in new process group to avoid receiving signals
-	// (Ctrl+C, Ctrl+Break) from the console
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-	}
-	return cmd
-}
-
-// ProcessOSSpecificInitialization chnages the soft limit for filedescriptor for process
+// ProcessOSSpecificInitialization changes the soft limit for filedescriptor for process
 // return the filedescriptor limit for process. If the function fails with some, it returns
 // the error
 // TODO: this api is implemented for windows as well but not required because Windows
@@ -61,9 +48,7 @@ func GetAzCopyAppPath() string {
 	lcm := common.GetLifecycleMgr()
 	userProfile := lcm.GetEnvironmentVariable(common.EEnvironmentVariable.UserDir())
 	azcopyAppDataFolder := strings.ReplaceAll(path.Join(userProfile, ".azcopy"), "/", `\`)
-	if err := os.Mkdir(azcopyAppDataFolder, os.ModeDir); err != nil && !os.IsExist(err) {
-		return ""
-	}
+
 	return azcopyAppDataFolder
 }
 

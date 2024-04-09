@@ -21,36 +21,48 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"net/url"
+	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-pipeline-go/pipeline"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-storage-azcopy/v10/jobsAdmin"
 
 	"github.com/Azure/azure-storage-azcopy/v10/common"
 	"github.com/Azure/azure-storage-azcopy/v10/ste"
-	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/spf13/cobra"
 )
 
-var azcopyAppPathFolder string
+var AzcopyAppPathFolder string
 var azcopyLogPathFolder string
-var azcopyJobPlanFolder string
 var azcopyMaxFileAndSocketHandles int
 var outputFormatRaw string
+var outputVerbosityRaw string
+var logVerbosityRaw string
 var cancelFromStdin bool
 var azcopyOutputFormat common.OutputFormat
+var azcopyOutputVerbosity common.OutputVerbosity
+var azcopyLogVerbosity common.LogLevel
+var loggerInfo jobLoggerInfo
 var cmdLineCapMegaBitsPerSecond float64
 var azcopyAwaitContinue bool
 var azcopyAwaitAllowOpenFiles bool
 var azcopyScanningLogger common.ILoggerResetable
 var azcopyCurrentJobID common.JobID
+var azcopySkipVersionCheck bool
+var retryStatusCodes string
+
+type jobLoggerInfo struct {
+	jobID         common.JobID
+	logFileFolder string
+}
 
 // It's not pretty that this one is read directly by credential util.
 // But doing otherwise required us passing it around in many places, even though really
@@ -74,6 +86,16 @@ var rootCmd = &cobra.Command{
 				ste.UploadTryTimeout = timeout
 			}
 		}
+
+		if retryStatusCodes != "" {
+			retryStatusCodes = retryStatusCodes + ";408;429;500;502;503;504"
+			rsc, err := ste.ParseRetryCodes(retryStatusCodes)
+			if err != nil {
+				return err
+			}
+			ste.RetryStatusCodes = rsc
+		}
+
 		glcm.E2EEnableAwaitAllowOpenFiles(azcopyAwaitAllowOpenFiles)
 		if azcopyAwaitContinue {
 			glcm.E2EAwaitContinue()
@@ -86,6 +108,36 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+
+		err = azcopyOutputVerbosity.Parse(outputVerbosityRaw)
+		glcm.SetOutputVerbosity(azcopyOutputVerbosity)
+		if err != nil {
+			return err
+		}
+
+		err = azcopyLogVerbosity.Parse(logVerbosityRaw)
+		if err != nil {
+			return err
+		}
+
+		// If the command is for resuming a job with a specific JobID,
+		// use the provided JobID to resume the job; otherwise, create a new JobID.
+		if cmd.Use == "resume [jobID]" {
+			// If no argument is passed then it is not valid
+			if len(args) != 1 {
+				return errors.New("this command requires jobId to be passed as argument")
+			}
+
+			loggerInfo.jobID, err = common.ParseJobID(args[0])
+
+			if err != nil {
+				return err
+			}
+
+		}
+
+		common.AzcopyCurrentJobLogger = common.NewJobLogger(loggerInfo.jobID, azcopyLogVerbosity, loggerInfo.logFileFolder, "")
+		common.AzcopyCurrentJobLogger.OpenLog()
 
 		glcm.SetForceLogging()
 
@@ -111,11 +163,11 @@ var rootCmd = &cobra.Command{
 
 		// startup of the STE happens here, so that the startup can access the values of command line parameters that are defined for "root" command
 		concurrencySettings := ste.NewConcurrencySettings(azcopyMaxFileAndSocketHandles, preferToAutoTuneGRs)
-		err = ste.MainSTE(concurrencySettings, float64(cmdLineCapMegaBitsPerSecond), azcopyJobPlanFolder, azcopyLogPathFolder, providePerformanceAdvice)
+		err = jobsAdmin.MainSTE(concurrencySettings, float64(cmdLineCapMegaBitsPerSecond), common.AzcopyJobPlanFolder, azcopyLogPathFolder, providePerformanceAdvice)
 		if err != nil {
 			return err
 		}
-	        EnumerationParallelism = concurrencySettings.EnumerationPoolSize.Value
+		EnumerationParallelism = concurrencySettings.EnumerationPoolSize.Value
 		EnumerationParallelStatFiles = concurrencySettings.ParallelStatFiles.Value
 
 		// Log a clear ISO 8601-formatted start time, so it can be read and use in the --include-after parameter
@@ -126,14 +178,16 @@ var rootCmd = &cobra.Command{
 		startTimeMessage := fmt.Sprintf("ISO 8601 START TIME: to copy files that changed before or after this job started, use the parameter --%s=%s or --%s=%s",
 			common.IncludeBeforeFlagName, IncludeBeforeDateFilter{}.FormatAsUTC(adjustedTime),
 			common.IncludeAfterFlagName, IncludeAfterDateFilter{}.FormatAsUTC(adjustedTime))
-		ste.JobsAdmin.LogToJobLog(startTimeMessage, pipeline.LogInfo)
+		jobsAdmin.JobsAdmin.LogToJobLog(startTimeMessage, common.LogInfo)
 
-		// spawn a routine to fetch and compare the local application's version against the latest version available
-		// if there's a newer version that can be used, then write the suggestion to stderr
-		// however if this takes too long the message won't get printed
-		// Note: this function is necessary for non-help, non-login commands, since they don't reach the corresponding
-		// beginDetectNewVersion call in Execute (below)
-		beginDetectNewVersion()
+		if !azcopySkipVersionCheck {
+			// spawn a routine to fetch and compare the local application's version against the latest version available
+			// if there's a newer version that can be used, then write the suggestion to stderr
+			// however if this takes too long the message won't get printed
+			// Note: this function is necessary for non-help, non-login commands, since they don't reach the corresponding
+			// beginDetectNewVersion call in Execute (below)
+			beginDetectNewVersion()
+		}
 
 		if debugSkipFiles != "" {
 			for _, v := range strings.Split(debugSkipFiles, ";") {
@@ -155,23 +209,26 @@ var glcmSwapOnce = &sync.Once{}
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute(azsAppPathFolder, logPathFolder string, jobPlanFolder string, maxFileAndSocketHandles int) {
-	azcopyAppPathFolder = azsAppPathFolder
+
+func Execute(logPathFolder, jobPlanFolder string, maxFileAndSocketHandles int, jobID common.JobID) {
 	azcopyLogPathFolder = logPathFolder
-	azcopyJobPlanFolder = jobPlanFolder
+	common.AzcopyJobPlanFolder = jobPlanFolder
 	azcopyMaxFileAndSocketHandles = maxFileAndSocketHandles
-	azcopyCurrentJobID = common.NewJobID()
+	azcopyCurrentJobID = jobID
+	loggerInfo = jobLoggerInfo{jobID, logPathFolder}
 
 	if err := rootCmd.Execute(); err != nil {
 		glcm.Error(err.Error())
 	} else {
-		// our commands all control their own life explicitly with the lifecycle manager
-		// only commands that don't explicitly exit actually reach this point (e.g. help commands and login commands)
-		select {
-		case <-beginDetectNewVersion():
-			// noop
-		case <-time.After(time.Second * 8):
-			// don't wait too long
+		if !azcopySkipVersionCheck {
+			// our commands all control their own life explicitly with the lifecycle manager
+			// only commands that don't explicitly exit actually reach this point (e.g. help commands and login commands)
+			select {
+			case <-beginDetectNewVersion():
+				// noop
+			case <-time.After(time.Second * 8):
+				// don't wait too long
+			}
 		}
 		glcm.Exit(nil, common.EExitCode.Success())
 	}
@@ -183,9 +240,13 @@ func init() {
 
 	rootCmd.PersistentFlags().Float64Var(&cmdLineCapMegaBitsPerSecond, "cap-mbps", 0, "Caps the transfer rate, in megabits per second. Moment-by-moment throughput might vary slightly from the cap. If this option is set to zero, or it is omitted, the throughput isn't capped.")
 	rootCmd.PersistentFlags().StringVar(&outputFormatRaw, "output-type", "text", "Format of the command's output. The choices include: text, json. The default value is 'text'.")
+	rootCmd.PersistentFlags().StringVar(&outputVerbosityRaw, "output-level", "default", "Define the output verbosity. Available levels: essential, quiet.")
+	rootCmd.PersistentFlags().StringVar(&logVerbosityRaw, "log-level", "INFO", "Define the log verbosity for the log file, available levels: INFO(all requests/responses), WARNING(slow responses), ERROR(only failed requests), and NONE(no output logs). (default 'INFO').")
 
 	rootCmd.PersistentFlags().StringVar(&cmdLineExtraSuffixesAAD, trustedSuffixesNameAAD, "", "Specifies additional domain suffixes where Azure Active Directory login tokens may be sent.  The default is '"+
 		trustedSuffixesAAD+"'. Any listed here are added to the default. For security, you should only put Microsoft Azure domains here. Separate multiple entries with semi-colons.")
+
+	rootCmd.PersistentFlags().BoolVar(&azcopySkipVersionCheck, "skip-version-check", false, "Do not perform the version check at startup. Intended for automation scenarios & airgapped use.")
 
 	// Note: this is due to Windows not supporting signals properly
 	rootCmd.PersistentFlags().BoolVar(&cancelFromStdin, "cancel-from-stdin", false, "Used by partner teams to send in `cancel` through stdin to stop a job.")
@@ -196,12 +257,16 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&debugSkipFiles, "debug-skip-files", "", "Used when debugging, to tell AzCopy to cancel the job midway. List of relative paths to skip in the STE.")
 
 	// reserved for partner teams
-	rootCmd.PersistentFlags().MarkHidden("cancel-from-stdin")
+	_ = rootCmd.PersistentFlags().MarkHidden("cancel-from-stdin")
+
+	// special flags to be used in case of unexpected service errors.
+	rootCmd.PersistentFlags().StringVar(&retryStatusCodes, "retry-status-codes", "", "Comma-separated list of HTTP status codes to retry on. (default '408;429;500;502;503;504')")
+	_ = rootCmd.PersistentFlags().MarkHidden("retry-status-codes")
 
 	// debug-only
-	rootCmd.PersistentFlags().MarkHidden("await-continue")
-	rootCmd.PersistentFlags().MarkHidden("await-open")
-	rootCmd.PersistentFlags().MarkHidden("debug-skip-files")
+	_ = rootCmd.PersistentFlags().MarkHidden("await-continue")
+	_ = rootCmd.PersistentFlags().MarkHidden("await-open")
+	_ = rootCmd.PersistentFlags().MarkHidden("debug-skip-files")
 }
 
 // always spins up a new goroutine, because sometimes the aka.ms URL can't be reached (e.g. a constrained environment where
@@ -214,60 +279,58 @@ func beginDetectNewVersion() chan struct{} {
 	go func() {
 		const versionMetadataUrl = "https://azcopyvnextrelease.blob.core.windows.net/releasemetadata/latest_version.txt"
 
-		// step 0: check the Stderr before checking version
+		// step 0: check the Stderr, check local version
 		_, err := os.Stderr.Stat()
 		if err != nil {
 			return
 		}
 
-		// step 1: initialize pipeline
-		p, err := createBlobPipeline(context.TODO(), common.CredentialInfo{CredentialType: common.ECredentialType.Anonymous()}, pipeline.LogNone)
+		localVersion, err := NewVersion(common.AzcopyVersion)
 		if err != nil {
 			return
 		}
 
-		// step 2: parse source url
-		u, err := url.Parse(versionMetadataUrl)
-		if err != nil {
-			return
+		// step 1: fetch & validate cached version and if it is updated, return without making API calls
+		filePath := filepath.Join(azcopyLogPathFolder, "latest_version.txt")
+		cachedVersion, err := ValidateCachedVersion(filePath) // same as the remote version
+		if err == nil {
+			PrintOlderVersion(*cachedVersion, *localVersion)
+		} else {
+			// step 2: initialize pipeline
+			options := createClientOptions(nil, nil)
+
+			// step 3: start download
+			blobClient, err := blob.NewClientWithNoCredential(versionMetadataUrl, &blob.ClientOptions{ClientOptions: options})
+			if err != nil {
+				return
+			}
+
+			downloadBlobResp, err := blobClient.DownloadStream(context.TODO(), nil)
+			if err != nil {
+				return
+			}
+
+			// step 4: read newest version str
+			data := make([]byte, *downloadBlobResp.ContentLength)
+			_, err = downloadBlobResp.Body.Read(data)
+			defer downloadBlobResp.Body.Close()
+			if err != nil && err != io.EOF {
+				return
+			}
+
+			remoteVersion, err := NewVersion(string(data))
+			if err != nil {
+				return
+			}
+
+			PrintOlderVersion(*remoteVersion, *localVersion)
+
+			// step 5: persist remote version in local
+			err = localVersion.CacheRemoteVersion(*remoteVersion, filePath)
+			if err != nil {
+				return
+			}
 		}
-
-		// step 3: start download
-		blobURL := azblob.NewBlobURL(*u, p)
-		blobStream, err := blobURL.Download(context.TODO(), 0, azblob.CountToEnd, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-		if err != nil {
-			return
-		}
-
-		blobBody := blobStream.Body(azblob.RetryReaderOptions{MaxRetryRequests: ste.MaxRetryPerDownloadBody})
-		defer blobBody.Close()
-
-		// step 4: read newest version str
-		buf := new(bytes.Buffer)
-		n, err := buf.ReadFrom(blobBody)
-		if n == 0 || err != nil {
-			return
-		}
-		// only take the first line, in case the version metadata file is upgraded in the future
-		// remoteVersion := strings.Split(buf.String(), "\n")[0]
-
-		// step 5: compare remote version to local version to see if there's a newer AzCopy
-		//v1, err := NewVersion(common.AzcopyVersion)
-		//if err != nil {
-		//	return
-		//}
-		//v2, err := NewVersion(remoteVersion)
-		//if err != nil {
-		//	return
-		//}
-
-		//if v1.OlderThan(*v2) {
-			// executablePathSegments := strings.Split(strings.Replace(os.Args[0], "\\", "/", -1), "/")
-			// executableName := executablePathSegments[len(executablePathSegments)-1]
-
-			// output in info mode instead of stderr, as it was crashing CI jobs of some people
-			// glcm.Info(executableName + ": A newer version " + remoteVersion + " is available to download\n")
-		//}
 
 		// let caller know we have finished, if they want to know
 		close(completionChannel)
